@@ -72,6 +72,59 @@ b_server_hash(__be32 source_address, __be32 destination_address,
     return hash;
 }
 
+static __always_inline __sum16 fold_checksum(__u32 checksum)
+{
+    checksum = (checksum & 0xffff) + (checksum >> 16);
+    checksum = (checksum & 0xffff) + (checksum >> 16);
+    return ~checksum;
+}
+
+static __always_inline __sum16 update_checksum_32(__sum16 old_checksum,
+                                                   __be32 old_value,
+                                                   __be32 new_value)
+{
+    __u32 checksum = ~((__u32)old_checksum) & 0xffff;
+
+    checksum = bpf_csum_diff(&old_value, sizeof(old_value),
+                             &new_value, sizeof(new_value), checksum);
+    return fold_checksum(checksum);
+}
+
+static __always_inline __attribute__((unused)) void
+rewrite_destination_ip(struct iphdr *ipv4_header, void *transport_header,
+                       __be32 new_destination_address)
+{
+    __be32 old_destination_address = ipv4_header->daddr;
+
+    ipv4_header->check = update_checksum_32(ipv4_header->check,
+                                            old_destination_address,
+                                            new_destination_address);
+
+    if (ipv4_header->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp_header = transport_header;
+
+        tcp_header->check = update_checksum_32(tcp_header->check,
+                                               old_destination_address,
+                                               new_destination_address);
+    } else if (ipv4_header->protocol == IPPROTO_UDP) {
+        struct udphdr *udp_header = transport_header;
+
+        if (udp_header->check)
+            udp_header->check = update_checksum_32(udp_header->check,
+                                                   old_destination_address,
+                                                   new_destination_address);
+    }
+
+    ipv4_header->daddr = new_destination_address;
+}
+
+static __always_inline void
+rewrite_destination_mac(struct ethhdr *ethernet_header,
+                        const __u8 new_destination_mac[ETH_ALEN])
+{
+    __builtin_memcpy(ethernet_header->h_dest, new_destination_mac, ETH_ALEN);
+}
+
 SEC("xdp")
 int xdp_lb(struct xdp_md *ctx)
 {
@@ -84,6 +137,7 @@ int xdp_lb(struct xdp_md *ctx)
     struct vip_key vip = {};
     struct vip_config *vip_config;
     struct b_server_key b_server_key = {};
+    struct b_server *selected_b_server;
     __u16 source_port;
     __u16 destination_port;
     __u32 flow_hash;
@@ -146,10 +200,14 @@ int xdp_lb(struct xdp_md *ctx)
     b_server_key.vip = vip;
     b_server_key.slot = flow_hash % vip_config->b_server_count;
 
-    if (!bpf_map_lookup_elem(&b_server_map, &b_server_key))
+    selected_b_server = bpf_map_lookup_elem(&b_server_map, &b_server_key);
+    if (!selected_b_server)
         return XDP_PASS;
 
-    return XDP_PASS;
+    rewrite_destination_mac(ethernet_header,
+                            selected_b_server->mac_address);
+
+    return XDP_TX;
 }
 
 char _license[] SEC("license") = "GPL";
