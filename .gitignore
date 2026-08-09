@@ -1,1 +1,3 @@
 *.o
+*.txt
+xdp_lb_ctl
