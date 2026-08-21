@@ -1,49 +1,30 @@
 #include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
 #include <linux/in.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
-#include <bpf/bpf_helpers.h>
+#include <linux/ip.h>
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_helpers.h>
 
-#define IPV4_MORE_FRAGMENTS_FLAG 0x2000
-#define IPV4_FRAGMENT_OFFSET_MASK 0x1fff
-#define IPV4_DONT_FRAGMENT_FLAG 0x4000
-#define IPV4_ADDRESS_FAMILY 2
-#define DEFAULT_TUNNEL_TTL 64
+#include "xdp_lb_common.h"
+
+/*
+ * XDP DSR load balance
+ *
+ * Load-balancer flow:
+ *   parse -> reject fragments -> find VIP -> hash the 5-tuple
+ *         -> find backend
+ *         -> encapsulate with outer Ethernet + IPv4 -> redirect
+ */
+
 #define ETHERIP_PROTOCOL 97
-#define TUNNEL_CONFIG_KEY 0
-#define MAX_SERVERS_PER_VIP 64
+#define IPV4_FAMILY 2
+#define DEFAULT_TTL 64
+#define IPV4_DF 0x4000
+#define IPV4_FRAG_BITS (0x2000 | 0x1fff)
+#define DEVICE_IP_KEY 0
+#define ENCAPSULATION_FAILED 0
+#define ENCAPSULATION_SUCCESS 1
 
-struct vip_key {
-    __be32 address;
-    __be16 port;
-    __u8 protocol;
-    __u8 padding;
-};
-
-struct vip_config {
-    __u32 server_count;
-};
-
-struct server_key {
-    struct vip_key vip;
-    __u32 slot;
-};
-
-struct server {
-    __be32 address;
-    __u8 mac_address[ETH_ALEN];
-};
-
-struct tunnel_config {
-    __be32 source_address;
-};
-
-struct flow_info {
-    struct ethhdr *eth;
-    struct iphdr *ip;
+struct flow_key {
     __be32 source_address;
     __be32 destination_address;
     __be16 source_port;
@@ -51,7 +32,7 @@ struct flow_info {
     __u8 protocol;
 };
 
-struct transport_ports {
+struct layer4_ports {
     __be16 source;
     __be16 destination;
 };
@@ -60,270 +41,225 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
     __type(key, struct vip_key);
-    __type(value, struct vip_config);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(value, struct vip_value);
 } vip_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
-    __type(key, struct server_key);
-    __type(value, struct server);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-} server_map SEC(".maps");
+    __type(key, struct backend_key);
+    __type(value, struct backend);
+} backend_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct tunnel_config);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-} tunnel_config_map SEC(".maps");
+    __type(value, struct device_config);
+} device_ip_map SEC(".maps");
 
-/* Keep packets from the same 5-tuple on the same server. */
-static __always_inline __u32 flow_hash(const struct flow_info *flow)
-{
-    const __u32 fnv1a_offset_basis = 2166136261u;
-    const __u32 fnv1a_prime = 16777619u;
-    __u32 hash = fnv1a_offset_basis;
+/* ------------------------------- Parser ------------------------------ */
 
-    hash ^= flow->source_address;
-    hash *= fnv1a_prime;
-
-    hash ^= flow->destination_address;
-    hash *= fnv1a_prime;
-
-    hash ^= ((__u32)flow->source_port << 16) | flow->destination_port;
-    hash *= fnv1a_prime;
-
-    hash ^= flow->protocol;
-    hash *= fnv1a_prime;
-
-    return hash;
-}
-
-static __always_inline __sum16 fold_checksum(__u32 checksum)
-{
-    checksum = (checksum & 0xffff) + (checksum >> 16);
-    checksum = (checksum & 0xffff) + (checksum >> 16);
-    return ~checksum;
-}
-
-static __always_inline __sum16 ipv4_header_checksum(struct iphdr *ip)
-{
-    __u32 checksum = 0;
-    __u16 *word = (__u16 *)ip;
-
-    ip->check = 0;
-
-#pragma clang loop unroll(full)
-    for (__u32 i = 0; i < sizeof(*ip) / sizeof(*word); i++)
-        checksum += word[i];
-
-    return fold_checksum(checksum);
-}
-
-static __always_inline int parse_flow(struct xdp_md *ctx,
-                                      struct flow_info *flow)
+static __always_inline int parse_client_packet(struct xdp_md *ctx, struct vip_key *vip, struct flow_key *flow)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    struct ethhdr *eth = data;
+    struct ethhdr *ethernet = data;
+    struct iphdr *ipv4;
+    struct layer4_ports *ports;
+    __u32 ipv4_length;
+    __u32 total_length;
+    __u32 available_length;
 
-    if ((void *)(eth + 1) > data_end)
+    if ((void *)(ethernet + 1) > data_end || ethernet->h_proto != bpf_htons(ETH_P_IP))
         return -1;
 
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    ipv4 = (void *)(ethernet + 1);
+    if ((void *)(ipv4 + 1) > data_end)
         return -1;
 
-    struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end)
+    ipv4_length = ipv4->ihl * 4;
+    total_length = bpf_ntohs(ipv4->tot_len);
+    available_length = data_end - (void *)ipv4;
+    if (ipv4->version != 4 || ipv4_length < sizeof(*ipv4) || total_length < ipv4_length || total_length > available_length)
         return -1;
 
-    __u8 ip_header_length = ip->ihl * 4;
-    if (ip->version != 4 || ip_header_length < sizeof(*ip))
+    if (bpf_ntohs(ipv4->frag_off) & IPV4_FRAG_BITS)
         return -1;
 
-    if ((void *)ip + ip_header_length > data_end)
+    if (ipv4->protocol != IPPROTO_TCP && ipv4->protocol != IPPROTO_UDP)
         return -1;
 
-    __u16 fragment_offset = bpf_ntohs(ip->frag_off);
-    if (fragment_offset &
-        (IPV4_MORE_FRAGMENTS_FLAG | IPV4_FRAGMENT_OFFSET_MASK))
+    ports = (void *)ipv4 + ipv4_length;
+    if (ipv4_length + sizeof(*ports) > total_length || (void *)(ports + 1) > data_end)
         return -1;
 
-    void *transport_header = (void *)ip + ip_header_length;
+    vip->address = ipv4->daddr;
+    vip->port = ports->destination;
+    vip->protocol = ipv4->protocol;
+    vip->padding = 0;
 
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = transport_header;
-
-        if ((void *)(tcp + 1) > data_end)
-            return -1;
-    } else if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = transport_header;
-
-        if ((void *)(udp + 1) > data_end)
-            return -1;
-    } else {
-        return -1;
-    }
-
-    struct transport_ports *ports = transport_header;
-
-    flow->eth = eth;
-    flow->ip = ip;
-    flow->source_address = ip->saddr;
-    flow->destination_address = ip->daddr;
+    flow->source_address = ipv4->saddr;
+    flow->destination_address = ipv4->daddr;
     flow->source_port = ports->source;
     flow->destination_port = ports->destination;
-    flow->protocol = ip->protocol;
-
+    flow->protocol = ipv4->protocol;
     return 0;
 }
 
-static __always_inline struct vip_config *
-lookup_vip(const struct flow_info *flow, struct vip_key *vip)
+/* ------------------------- Hash ------------------------- */
+static __always_inline __u32 mix_hash(__u32 hash, __u32 value)
 {
-    vip->address = flow->destination_address;
-    vip->port = flow->destination_port;
-    vip->protocol = flow->protocol;
+    return (hash ^ value) * 16777619u;
+}
 
-    struct vip_config *config = bpf_map_lookup_elem(&vip_map, vip);
+static __always_inline __u32 flow_hash(const struct flow_key *flow)
+{
+    __u32 ports = ((__u32)flow->source_port << 16) | flow->destination_port;
+    __u32 hash = 2166136261u;
 
-    if (!config || config->server_count == 0 ||
-        config->server_count > MAX_SERVERS_PER_VIP)
+    hash = mix_hash(hash, flow->source_address);
+    hash = mix_hash(hash, flow->destination_address);
+    hash = mix_hash(hash, ports);
+    return mix_hash(hash, flow->protocol);
+}
+
+static __always_inline struct backend *select_backend(const struct vip_key *vip, const struct vip_value *vip_value, const struct flow_key *flow)
+{
+    struct backend_key key = {};
+    __u32 backend_count = vip_value->backend_count;
+    if (backend_count == 0 || backend_count > MAX_BACKENDS_PER_VIP)
         return 0;
+    key.vip = *vip;
+    key.slot = flow_hash(flow) % backend_count;
 
-    return config;
+    return bpf_map_lookup_elem(&backend_map, &key);
 }
 
-static __always_inline struct server *
-select_server(const struct flow_info *flow, const struct vip_key *vip,
-              const struct vip_config *config)
-{
-    struct server_key key = {
-        .vip = *vip,
-        .slot = flow_hash(flow) % config->server_count,
-    };
+/* ------------------------------- Built Packet ------------------------------ */
 
-    return bpf_map_lookup_elem(&server_map, &key);
+static __always_inline __sum16 ipv4_checksum(const struct iphdr *ipv4)
+{
+    const __u16 *words = (const __u16 *)ipv4;
+    __u32 sum = 0;
+
+    for (__u32 i = 0; i < sizeof(*ipv4) / sizeof(*words); i++)
+        sum += words[i];
+
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    return ~sum;
 }
 
-static __always_inline struct tunnel_config *get_tunnel_config(void)
+static __always_inline void build_outer_ipv4(struct iphdr *ipv4, __u16 total_length, __be32 source, __be32 destination)
 {
-    __u32 key = TUNNEL_CONFIG_KEY;
-    struct tunnel_config *config =
-        bpf_map_lookup_elem(&tunnel_config_map, &key);
-
-    if (!config || !config->source_address)
-        return 0;
-
-    return config;
+    ipv4->version = 4;
+    ipv4->ihl = sizeof(*ipv4) / 4;
+    ipv4->tos = 0;
+    ipv4->tot_len = bpf_htons(total_length);
+    ipv4->id = 0;
+    ipv4->frag_off = bpf_htons(IPV4_DF);
+    ipv4->ttl = DEFAULT_TTL;
+    ipv4->protocol = ETHERIP_PROTOCOL;
+    ipv4->saddr = source;
+    ipv4->daddr = destination;
+    ipv4->check = 0;
+    ipv4->check = ipv4_checksum(ipv4);
 }
 
-static __always_inline void
-build_outer_ipv4_header(struct iphdr *outer_ip, __u32 total_length,
-                        __be32 source_address, __be32 destination_address)
+static __always_inline int encapsulate_packet(struct xdp_md *ctx, const struct device_config *device, const struct backend *backend, struct bpf_fib_lookup *route, int *failure_action)
 {
-    outer_ip->version = 4;
-    outer_ip->ihl = sizeof(*outer_ip) / 4;
-    outer_ip->tos = 0;
-    outer_ip->tot_len = bpf_htons(total_length);
-    outer_ip->id = 0;
-    outer_ip->frag_off = bpf_htons(IPV4_DONT_FRAGMENT_FLAG);
-    outer_ip->ttl = DEFAULT_TUNNEL_TTL;
-    outer_ip->protocol = ETHERIP_PROTOCOL;
-    outer_ip->saddr = source_address;
-    outer_ip->daddr = destination_address;
-    outer_ip->check = ipv4_header_checksum(outer_ip);
-}
-
-static __always_inline int
-encapsulate_and_redirect(struct xdp_md *ctx,
-                         const struct tunnel_config *tunnel,
-                         const struct server *server)
-{
+    const int headers_size = sizeof(struct ethhdr) + sizeof(struct iphdr);
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    __u32 inner_length = data_end - data;
-    __u32 outer_length = inner_length + sizeof(struct iphdr);
+    __u32 inner_size = data_end - data;
+    __u32 outer_ip_size = sizeof(struct iphdr) + inner_size;
+    struct ethhdr *outer_ethernet;
+    struct iphdr *outer_ipv4;
+    struct ethhdr *inner_ethernet;
+    int fib_result;
 
-    if (inner_length < sizeof(struct ethhdr) + sizeof(struct iphdr) ||
-        outer_length > 0xffff)
-        return XDP_PASS;
+    *failure_action = XDP_PASS;
 
-    struct bpf_fib_lookup route = {
-        .family = IPV4_ADDRESS_FAMILY,
-        .ifindex = ctx->ingress_ifindex,
-        .l4_protocol = ETHERIP_PROTOCOL,
-        .tot_len = outer_length,
-        .ipv4_src = tunnel->source_address,
-        .ipv4_dst = server->address,
-    };
+    if (inner_size < sizeof(struct ethhdr) + sizeof(struct iphdr) || outer_ip_size > 0xffff)
+        return ENCAPSULATION_FAILED;
 
-    int fib_result = bpf_fib_lookup(ctx, &route, sizeof(route),
-                                    BPF_FIB_LOOKUP_OUTPUT);
+    route->family = IPV4_FAMILY;
+    route->ifindex = ctx->ingress_ifindex;
+    route->l4_protocol = ETHERIP_PROTOCOL;
+    route->tot_len = outer_ip_size;
+    route->ipv4_src = device->ip_address;
+    route->ipv4_dst = backend->address;
 
-    /* Neighbor discovery must be handled by the control plane. */
+    fib_result = bpf_fib_lookup(ctx, route, sizeof(*route), 0);
     if (fib_result == BPF_FIB_LKUP_RET_NO_NEIGH)
-        return XDP_PASS;
-
+        return ENCAPSULATION_FAILED;
     if (fib_result != BPF_FIB_LKUP_RET_SUCCESS)
-        return XDP_PASS;
+        return ENCAPSULATION_FAILED;
 
-    if (bpf_xdp_adjust_head(ctx, 0 -
-                            (int)(sizeof(struct ethhdr) +
-                                  sizeof(struct iphdr))))
-        return XDP_PASS;
+    if (bpf_xdp_adjust_head(ctx, -headers_size))
+        return ENCAPSULATION_FAILED;
 
-    /* Packet memory may have moved, so reload all data pointers. */
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
+    outer_ethernet = data;
+    outer_ipv4 = (void *)(outer_ethernet + 1);
+    inner_ethernet = (void *)(outer_ipv4 + 1);
 
-    struct ethhdr *outer_eth = data;
-    struct iphdr *outer_ip = (void *)(outer_eth + 1);
-    struct ethhdr *inner_eth = data + sizeof(struct ethhdr) +
-                              sizeof(struct iphdr);
+    if ((void *)(inner_ethernet + 1) > data_end) {
+        *failure_action = XDP_DROP;
+        return ENCAPSULATION_FAILED;
+    }
 
-    if ((void *)(outer_ip + 1) > data_end ||
-        (void *)(inner_eth + 1) > data_end)
-        return XDP_DROP;
+    __builtin_memcpy(outer_ethernet->h_source, route->smac, ETH_ALEN);
+    __builtin_memcpy(outer_ethernet->h_dest, route->dmac, ETH_ALEN);
+    outer_ethernet->h_proto = bpf_htons(ETH_P_IP);
+    __builtin_memcpy(inner_ethernet->h_source, route->smac, ETH_ALEN);
+    __builtin_memcpy(inner_ethernet->h_dest, backend->mac, ETH_ALEN);
 
-    __builtin_memcpy(outer_eth->h_source, route.smac, ETH_ALEN);
-    __builtin_memcpy(outer_eth->h_dest, route.dmac, ETH_ALEN);
-    outer_eth->h_proto = bpf_htons(ETH_P_IP);
+    build_outer_ipv4(outer_ipv4, outer_ip_size, device->ip_address, backend->address);
 
-    __builtin_memcpy(inner_eth->h_source, route.smac, ETH_ALEN);
-    __builtin_memcpy(inner_eth->h_dest, server->mac_address, ETH_ALEN);
-
-    build_outer_ipv4_header(outer_ip, outer_length,
-                            tunnel->source_address, server->address);
-
-    return bpf_redirect(route.ifindex, 0);
+    return ENCAPSULATION_SUCCESS;
 }
 
-SEC("xdp")
-int xdp_lb(struct xdp_md *ctx)
+static __always_inline int redirect_packet(const struct bpf_fib_lookup *route)
 {
-    struct flow_info flow = {};
+    return bpf_redirect(route->ifindex, 0);
+}
 
-    if (parse_flow(ctx, &flow) < 0)
+/* -------------------------- Load-balancer flow ----------------------- */
+
+SEC("xdp")
+int xdp_lb_main(struct xdp_md *ctx)
+{
+    struct vip_key vip_key = {};
+    struct flow_key flow = {};
+    struct device_config *device;
+    struct vip_value *vip;
+    struct backend *backend;
+    struct bpf_fib_lookup route = {};
+    __u32 device_ip_key = DEVICE_IP_KEY;
+    int failure_action;
+
+    if (parse_client_packet(ctx, &vip_key, &flow))
         return XDP_PASS;
 
-    struct vip_key vip = {};
-    struct vip_config *vip_config = lookup_vip(&flow, &vip);
-    if (!vip_config)
+    vip = bpf_map_lookup_elem(&vip_map, &vip_key);
+    if (!vip)
         return XDP_PASS;
 
-    struct server *server = select_server(&flow, &vip, vip_config);
-    if (!server)
+    backend = select_backend(&vip_key, vip, &flow);
+    if (!backend)
         return XDP_PASS;
 
-    struct tunnel_config *tunnel = get_tunnel_config();
-    if (!tunnel)
+    device = bpf_map_lookup_elem(&device_ip_map, &device_ip_key);
+    if (!device || !device->ip_address)
         return XDP_PASS;
 
-    return encapsulate_and_redirect(ctx, tunnel, server);
+    if (encapsulate_packet(ctx, device, backend, &route, &failure_action) == ENCAPSULATION_FAILED)
+        return failure_action;
+
+    return redirect_packet(&route);
 }
 
 char _license[] SEC("license") = "GPL";

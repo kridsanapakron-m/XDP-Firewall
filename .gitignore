@@ -1,5 +1,5 @@
 *.o
 *.txt
 xdp_lb_ctl
-*test.c
-*.h
+*.sh
+*test*
