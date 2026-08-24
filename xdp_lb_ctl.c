@@ -13,55 +13,36 @@
 #define VIP_MAP_PATH MAP_DIR "/vip_map"
 #define BACKEND_MAP_PATH MAP_DIR "/backend_map"
 #define DEVICE_IP_MAP_PATH MAP_DIR "/device_ip_map"
-
-static void usage(const char *program)
-{
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s add-vip <vip_ip> <port> <tcp|udp> <backend_count>\n", program);
-    fprintf(stderr, "  %s del-vip <vip_ip> <port> <tcp|udp>\n", program);
-    fprintf(stderr, "  %s set-backend <vip_ip> <port> <tcp|udp> <slot> <backend_ip> <backend_mac>\n", program);
-    fprintf(stderr, "  %s del-backend <vip_ip> <port> <tcp|udp> <slot>\n", program);
-    fprintf(stderr, "  %s set-device-ip <device_ip>\n", program);
-    fprintf(stderr, "  %s list\n", program);
-}
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 
 /* ---------------------------- Input parsing -------------------------- */
 
-static int parse_port(const char *text, __be16 *port)
+static int parse_number(const char *text, __u32 minimum, __u32 maximum,
+                        __u32 *value, const char *name)
 {
     char *invalid;
     unsigned long number;
 
     errno = 0;
     number = strtoul(text, &invalid, 10);
-    if (errno || invalid == text || *invalid || number == 0 || number > 65535)
+    if (errno || invalid == text || *invalid ||
+        number < minimum || number > maximum) {
+        fprintf(stderr, "invalid %s: %s\n", name, text);
         return -1;
-
-    *port = htons((__u16)number);
-    return 0;
-}
-
-static int parse_uint32(const char *text, __u32 *value)
-{
-    char *invalid;
-    unsigned long number;
-
-    errno = 0;
-    number = strtoul(text, &invalid, 10);
-    if (errno || invalid == text || *invalid || number > 0xffffffffUL)
-        return -1;
+    }
 
     *value = (__u32)number;
     return 0;
 }
 
-static int parse_backend_number(const char *text, __u32 *value, __u32 minimum, __u32 maximum, const char *name)
+static int parse_port(const char *text, __be16 *port)
 {
-    if (parse_uint32(text, value) || *value < minimum || *value > maximum) {
-        fprintf(stderr, "invalid backend %s: %s\n", name, text);
-        return -1;
-    }
+    __u32 number;
 
+    if (parse_number(text, 1, 65535, &number, "VIP port"))
+        return -1;
+
+    *port = htons((__u16)number);
     return 0;
 }
 
@@ -75,6 +56,16 @@ static int parse_protocol(const char *text, __u8 *protocol)
         *protocol = IPPROTO_UDP;
         return 0;
     }
+    fprintf(stderr, "invalid protocol: %s\n", text);
+    return -1;
+}
+
+static int parse_ipv4(const char *text, __be32 *address, const char *name)
+{
+    if (inet_pton(AF_INET, text, address) == 1)
+        return 0;
+
+    fprintf(stderr, "invalid %s address: %s\n", name, text);
     return -1;
 }
 
@@ -82,18 +73,10 @@ static int parse_vip(char **arguments, struct vip_key *vip)
 {
     memset(vip, 0, sizeof(*vip));
 
-    if (inet_pton(AF_INET, arguments[0], &vip->address) != 1) {
-        fprintf(stderr, "invalid VIP address: %s\n", arguments[0]);
+    if (parse_ipv4(arguments[0], &vip->address, "VIP") ||
+        parse_port(arguments[1], &vip->port) ||
+        parse_protocol(arguments[2], &vip->protocol))
         return -1;
-    }
-    if (parse_port(arguments[1], &vip->port)) {
-        fprintf(stderr, "invalid VIP port: %s\n", arguments[1]);
-        return -1;
-    }
-    if (parse_protocol(arguments[2], &vip->protocol)) {
-        fprintf(stderr, "invalid protocol: %s\n", arguments[2]);
-        return -1;
-    }
 
     return 0;
 }
@@ -121,6 +104,20 @@ static void build_backend_key(struct backend_key *backend_key, const struct vip_
     backend_key->slot = slot;
 }
 
+static int parse_backend_key(char **arguments, struct backend_key *key)
+{
+    struct vip_key vip;
+    __u32 slot;
+
+    if (parse_vip(arguments, &vip) ||
+        parse_number(arguments[3], 0, MAX_BACKENDS_PER_VIP - 1,
+                     &slot, "backend slot"))
+        return -1;
+
+    build_backend_key(key, &vip, slot);
+    return 0;
+}
+
 /* ------------------------------- Map I/O ----------------------------- */
 
 static int open_map(const char *path)
@@ -132,46 +129,39 @@ static int open_map(const char *path)
     return fd;
 }
 
-static int update_map(const char *path, const void *key, const void *value)
+/* A NULL value means delete; any other value means upsert. */
+static int change_map(const char *path, const void *key, const void *value)
 {
     int fd = open_map(path);
     int result;
 
     if (fd < 0)
         return -1;
-    result = bpf_map_update_elem(fd, key, value, BPF_ANY);
-    if (result)
-        fprintf(stderr, "cannot update %s: %s\n", path, strerror(errno));
-    close(fd);
-    return result;
-}
 
-static int delete_map_entry(const char *path, const void *key)
-{
-    int fd = open_map(path);
-    int result;
-
-    if (fd < 0)
-        return -1;
-    result = bpf_map_delete_elem(fd, key);
-    if (result && errno == ENOENT)
+    result = value ? bpf_map_update_elem(fd, key, value, BPF_ANY)
+                   : bpf_map_delete_elem(fd, key);
+    if (result && !value && errno == ENOENT) {
         result = 0;
-    else if (result)
-        fprintf(stderr, "cannot delete from %s: %s\n", path, strerror(errno));
+    } else if (result) {
+        fprintf(stderr, "cannot %s %s: %s\n",
+                value ? "update" : "delete from", path, strerror(errno));
+    }
+
     close(fd);
     return result;
 }
 
 /* ------------------------------ Commands ----------------------------- */
 
-static int add_vip(int count, char **arguments)
+static int add_vip(char **arguments)
 {
     struct vip_value value = {};
     struct vip_key vip;
 
-    if (count != 4 || parse_vip(arguments, &vip))
+    if (parse_vip(arguments, &vip))
         return -1;
-    if (parse_backend_number(arguments[3], &value.backend_count, 1, MAX_BACKENDS_PER_VIP, "count"))
+    if (parse_number(arguments[3], 1, MAX_BACKENDS_PER_VIP,
+                     &value.backend_count, "backend count"))
         return -1;
 
     /*
@@ -179,262 +169,103 @@ static int add_vip(int count, char **arguments)
      * Scale up:   create the new backend slot, then increase the count.
      * Scale down: decrease the count, then delete the unused backend slot.
      */
-    return update_map(VIP_MAP_PATH, &vip, &value);
+    return change_map(VIP_MAP_PATH, &vip, &value);
 }
 
-static int delete_vip(int count, char **arguments)
+static int delete_vip(char **arguments)
 {
     struct vip_key vip;
 
-    if (count != 3 || parse_vip(arguments, &vip))
+    if (parse_vip(arguments, &vip))
         return -1;
-    return delete_map_entry(VIP_MAP_PATH, &vip);
+    return change_map(VIP_MAP_PATH, &vip, NULL);
 }
 
-static int set_backend(int count, char **arguments)
+static int set_backend(char **arguments)
 {
     struct backend backend = {};
     struct backend_key backend_key = {};
-    struct vip_key vip;
-    __u32 slot;
 
-    if (count != 6 || parse_vip(arguments, &vip))
+    if (parse_backend_key(arguments, &backend_key))
         return -1;
-    if (parse_backend_number(arguments[3], &slot, 0, MAX_BACKENDS_PER_VIP - 1, "slot"))
+    if (parse_ipv4(arguments[4], &backend.address, "backend"))
         return -1;
-    if (inet_pton(AF_INET, arguments[4], &backend.address) != 1) {
-        fprintf(stderr, "invalid backend address: %s\n", arguments[4]);
-        return -1;
-    }
     if (parse_mac(arguments[5], backend.mac)) {
         fprintf(stderr, "invalid backend MAC: %s\n", arguments[5]);
         return -1;
     }
 
     /* A backend may be prepared before its VIP is activated. */
-    build_backend_key(&backend_key, &vip, slot);
-    return update_map(BACKEND_MAP_PATH, &backend_key, &backend);
+    return change_map(BACKEND_MAP_PATH, &backend_key, &backend);
 }
 
-static int delete_backend(int count, char **arguments)
+static int delete_backend(char **arguments)
 {
     struct backend_key backend_key = {};
-    struct vip_key vip;
-    __u32 slot;
 
-    if (count != 4 || parse_vip(arguments, &vip))
+    if (parse_backend_key(arguments, &backend_key))
         return -1;
-    if (parse_backend_number(arguments[3], &slot, 0, MAX_BACKENDS_PER_VIP - 1, "slot"))
-        return -1;
-
-    build_backend_key(&backend_key, &vip, slot);
-    return delete_map_entry(BACKEND_MAP_PATH, &backend_key);
+    return change_map(BACKEND_MAP_PATH, &backend_key, NULL);
 }
 
-static int set_device_ip(int count, char **arguments)
+static int set_device_ip(char **arguments)
 {
     struct device_config device = {};
     __u32 key = 0;
 
-    if (count != 1)
+    if (parse_ipv4(arguments[0], &device.ip_address, "device IP"))
         return -1;
-    if (inet_pton(AF_INET, arguments[0], &device.ip_address) != 1) {
-        fprintf(stderr, "invalid device IP address: %s\n", arguments[0]);
-        return -1;
+    return change_map(DEVICE_IP_MAP_PATH, &key, &device);
+}
+
+/* -------------------------- Command dispatch ------------------------- */
+
+struct command {
+    const char *name;
+    const char *parameters;
+    size_t argument_count;
+    int (*run)(char **arguments);
+};
+
+static const struct command commands[] = {
+    { "add-vip", "<vip_ip> <port> <tcp|udp> <backend_count>", 4, add_vip },
+    { "del-vip", "<vip_ip> <port> <tcp|udp>", 3, delete_vip },
+    { "set-backend", "<vip_ip> <port> <tcp|udp> <slot> <backend_ip> <backend_mac>", 6, set_backend },
+    { "del-backend", "<vip_ip> <port> <tcp|udp> <slot>", 4, delete_backend },
+    { "set-device-ip", "<device_ip>", 1, set_device_ip },
+};
+
+static void usage(const char *program)
+{
+    fprintf(stderr, "Usage:\n");
+    for (size_t i = 0; i < ARRAY_SIZE(commands); i++)
+        fprintf(stderr, "  %s %s%s%s\n", program, commands[i].name,
+                commands[i].parameters[0] ? " " : "", commands[i].parameters);
+}
+
+static const struct command *find_command(const char *name)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(commands); i++) {
+        if (!strcmp(name, commands[i].name))
+            return &commands[i];
     }
-    return update_map(DEVICE_IP_MAP_PATH, &key, &device);
-}
-
-static const char *protocol_name(__u8 protocol)
-{
-    if (protocol == IPPROTO_TCP)
-        return "tcp";
-    if (protocol == IPPROTO_UDP)
-        return "udp";
-    return "unknown";
-}
-
-static void print_vip_name(const struct vip_key *vip)
-{
-    char address[INET_ADDRSTRLEN] = "invalid";
-
-    inet_ntop(AF_INET, &vip->address, address, sizeof(address));
-    printf("%s:%u/%s", address, ntohs(vip->port), protocol_name(vip->protocol));
-}
-
-static void print_backend(const struct backend *backend)
-{
-    char address[INET_ADDRSTRLEN] = "invalid";
-
-    inet_ntop(AF_INET, &backend->address, address, sizeof(address));
-    printf("%s %02x:%02x:%02x:%02x:%02x:%02x", address, backend->mac[0], backend->mac[1], backend->mac[2], backend->mac[3], backend->mac[4], backend->mac[5]);
-}
-
-/* Print every active VIP and the backend slots that it expects. */
-static int list_vips(int vip_fd, int backend_fd)
-{
-    struct vip_key current;
-    struct vip_key next;
-    const void *previous = NULL;
-
-    for (;;) {
-        struct vip_value vip_value;
-
-        if (bpf_map_get_next_key(vip_fd, previous, &next)) {
-            if (errno == ENOENT)
-                return 0;
-            fprintf(stderr, "cannot iterate vip_map: %s\n", strerror(errno));
-            return -1;
-        }
-
-        current = next;
-        previous = &current;
-
-        if (bpf_map_lookup_elem(vip_fd, &current, &vip_value)) {
-            /* The entry may have been deleted while list was running. */
-            if (errno == ENOENT)
-                continue;
-            fprintf(stderr, "cannot read vip_map: %s\n", strerror(errno));
-            return -1;
-        }
-
-        print_vip_name(&current);
-        printf(" backends=%u\n", vip_value.backend_count);
-
-        if (vip_value.backend_count == 0 || vip_value.backend_count > MAX_BACKENDS_PER_VIP) {
-            printf("  INVALID_COUNT\n");
-            continue;
-        }
-
-        for (__u32 slot = 0; slot < vip_value.backend_count; slot++) {
-            struct backend_key backend_key = {};
-            struct backend backend;
-
-            build_backend_key(&backend_key, &current, slot);
-            printf("  slot %u -> ", slot);
-
-            if (bpf_map_lookup_elem(backend_fd, &backend_key, &backend)) {
-                if (errno == ENOENT) {
-                    printf("MISSING\n");
-                    continue;
-                }
-                fprintf(stderr, "cannot read backend_map: %s\n", strerror(errno));
-                return -1;
-            }
-
-            print_backend(&backend);
-            printf("\n");
-        }
-    }
-}
-
-/* Find backend entries that cannot be selected by the current vip_map. */
-static int list_unusable_backends(int vip_fd, int backend_fd)
-{
-    struct backend_key current;
-    struct backend_key next;
-    const void *previous = NULL;
-    int printed_heading = 0;
-
-    for (;;) {
-        struct vip_value vip_value;
-        const char *problem = NULL;
-
-        if (bpf_map_get_next_key(backend_fd, previous, &next)) {
-            if (errno == ENOENT)
-                return 0;
-            fprintf(stderr, "cannot iterate backend_map: %s\n", strerror(errno));
-            return -1;
-        }
-
-        current = next;
-        previous = &current;
-
-        if (bpf_map_lookup_elem(vip_fd, &current.vip, &vip_value)) {
-            if (errno == ENOENT)
-                problem = "ORPHAN";
-            else {
-                fprintf(stderr, "cannot read vip_map: %s\n", strerror(errno));
-                return -1;
-            }
-        } else if (vip_value.backend_count == 0 || vip_value.backend_count > MAX_BACKENDS_PER_VIP) {
-            problem = "INVALID_VIP";
-        } else if (current.slot >= vip_value.backend_count) {
-            problem = "OUT_OF_RANGE";
-        }
-
-        if (!problem)
-            continue;
-
-        if (!printed_heading) {
-            printf("Backend configuration problems:\n");
-            printed_heading = 1;
-        }
-
-        printf("  ");
-        print_vip_name(&current.vip);
-        printf(" slot %u -> %s\n", current.slot, problem);
-    }
-}
-
-static int list_services(int count)
-{
-    int vip_fd;
-    int backend_fd;
-    int result;
-
-    if (count != 0)
-        return -1;
-
-    vip_fd = open_map(VIP_MAP_PATH);
-    backend_fd = open_map(BACKEND_MAP_PATH);
-    if (vip_fd < 0 || backend_fd < 0) {
-        if (vip_fd >= 0)
-            close(vip_fd);
-        if (backend_fd >= 0)
-            close(backend_fd);
-        return -1;
-    }
-
-    result = list_vips(vip_fd, backend_fd);
-    if (!result)
-        result = list_unusable_backends(vip_fd, backend_fd);
-
-    close(backend_fd);
-    close(vip_fd);
-    return result;
+    return NULL;
 }
 
 int main(int argc, char **argv)
 {
-    const char *command;
-    char **arguments;
-    int count;
-    int result = -1;
+    const struct command *command;
+    size_t argument_count;
 
     if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
-    command = argv[1];
-    arguments = &argv[2];
-    count = argc - 2;
-
-    if (!strcmp(command, "add-vip"))
-        result = add_vip(count, arguments);
-    else if (!strcmp(command, "del-vip"))
-        result = delete_vip(count, arguments);
-    else if (!strcmp(command, "set-backend"))
-        result = set_backend(count, arguments);
-    else if (!strcmp(command, "del-backend"))
-        result = delete_backend(count, arguments);
-    else if (!strcmp(command, "set-device-ip"))
-        result = set_device_ip(count, arguments);
-    else if (!strcmp(command, "list"))
-        result = list_services(count);
-
-    if (result) {
+    command = find_command(argv[1]);
+    argument_count = (size_t)(argc - 2);
+    if (!command || argument_count != command->argument_count ||
+        command->run(argv + 2)) {
         usage(argv[0]);
         return 1;
     }
@@ -444,49 +275,28 @@ int main(int argc, char **argv)
 /*
  * Example configuration
  * ---------------------
- *
- * Example addresses:
  *   VIP:              10.0.0.100:80/TCP
  *   Load balancer IP: 192.168.10.1
  *   Backend 0:        192.168.10.11  02:00:00:00:00:11
  *   Backend 1:        192.168.10.12  02:00:00:00:00:12
  *
- * 1. Set the source IP used by the outer tunnel packet:
- *
+ * Configure the tunnel source IP:
  *   sudo ./xdp_lb_ctl_test set-device-ip 192.168.10.1
  *
- * 2. Add all backend slots before activating the VIP:
- *
+ * Prepare every backend slot before activating the VIP:
  *   sudo ./xdp_lb_ctl_test set-backend 10.0.0.100 80 tcp 0 192.168.10.11 02:00:00:00:00:11
- *
  *   sudo ./xdp_lb_ctl_test set-backend 10.0.0.100 80 tcp 1 192.168.10.12 02:00:00:00:00:12
- *
- * 3. Add the VIP and specify that it has two backends:
- *
  *   sudo ./xdp_lb_ctl_test add-vip 10.0.0.100 80 tcp 2
  *
- * 4. Show the configured VIPs, backends, and configuration problems:
- *
- *   sudo ./xdp_lb_ctl_test list
- *
- * Scale up from two to three backends:
- *   - Add slot 2 first.
- *   - Then update the VIP backend count to 3.
- *
+ * add-vip is an upsert. Scale up by preparing the new slot first:
  *   sudo ./xdp_lb_ctl_test set-backend 10.0.0.100 80 tcp 2 192.168.10.13 02:00:00:00:00:13
  *   sudo ./xdp_lb_ctl_test add-vip 10.0.0.100 80 tcp 3
  *
- * Scale down from three to two backends:
- *   - Reduce the VIP backend count first.
- *   - Then delete the unused slot.
- *
+ * Scale down by decreasing backend_count before deleting the slot:
  *   sudo ./xdp_lb_ctl_test add-vip 10.0.0.100 80 tcp 2
  *   sudo ./xdp_lb_ctl_test del-backend 10.0.0.100 80 tcp 2
  *
- * Delete the service:
- *   - Delete the VIP first so no new packet can select its backends.
- *   - Then delete every backend slot.
- *
+ * Delete a service: remove the VIP first, then its backend slots.
  *   sudo ./xdp_lb_ctl_test del-vip 10.0.0.100 80 tcp
  *   sudo ./xdp_lb_ctl_test del-backend 10.0.0.100 80 tcp 0
  *   sudo ./xdp_lb_ctl_test del-backend 10.0.0.100 80 tcp 1
