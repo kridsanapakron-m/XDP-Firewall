@@ -2,17 +2,17 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <linux/udp.h> 
+#include <linux/udp.h>
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 
 #define THRESHOLD        250           // Max packets per second
 #define TIME_WINDOW_NS   1000000000ULL // 1 วินาที (หน่วย: นาโนวินาที)
 #define BLOCK_DURATION_NS 60000000000ULL // 60 วินาที
-#define HONEYPOT_IP      0xC0A8B89A    // IP ของ honeypot (192.168.184.154)
+#define HONEYPOT_IP      0xC0A8B8AC    // IP ของ honeypot (192.168.184.172)
 
-static const unsigned char honeypot_mac[6] = {0x00, 0x0c, 0x29, 0x01, 0xa3, 0x6e}; // MAC ของ honeypot
-static const unsigned char firewall_mac[6] = {0x00, 0x0c, 0x29, 0xd3, 0x85, 0x9d}; // MAC ของเครื่องจริง
+static const unsigned char honeypot_mac[6] = {0x00, 0x0c, 0x29, 0xd8, 0xe1, 0x62}; // MAC ของ honeypot
+static const unsigned char firewall_mac[6] = {0x00, 0x0c, 0x29, 0xdc, 0x63, 0xda}; // MAC ของเครื่องจริง
 
 struct rate_limit_entry {
     __u64 last_update;   // Timestamp ของการอัปเดตล่าสุด
@@ -28,22 +28,29 @@ struct {
     __type(value, struct rate_limit_entry);
 } rate_limit_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_DEVMAP);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);                // ifindex ปลายทาง
+} tx_port SEC(".maps");
+
 
 static __always_inline __u16 update_checksum(__u16 old_csum, __be32 old_ip, __be32 new_ip) {
     __u32 csum = (~old_csum & 0xFFFF);
-    
+
     // ลบค่า IP เดิมออก
     csum += (~old_ip >> 16) & 0xFFFF;
     csum += (~old_ip & 0xFFFF);
-    
+
     // บวกค่า IP ใหม่เข้าไป
     csum += (new_ip >> 16) & 0xFFFF;
     csum += (new_ip & 0xFFFF);
-    
+
     // ม้วนบิตที่ล้น
     csum = (csum & 0xFFFF) + (csum >> 16);
     csum = (csum & 0xFFFF) + (csum >> 16);
-    
+
     return ~csum;
 }
 
@@ -74,7 +81,6 @@ SEC("xdp") int ddos_protection(struct xdp_md *ctx) {
     if (entry) {
         // ── ตรวจสอบว่ายังอยู่ในช่วง block อยู่ไหม ──
         if (entry->blocked_until && now < entry->blocked_until) {
-            // bpf_printk("XDP: IP %x still blocked, routing to honeypot\n", src_ip);
             goto redirect_honeypot;
         }
 
@@ -106,11 +112,12 @@ SEC("xdp") int ddos_protection(struct xdp_md *ctx) {
     return XDP_PASS;
 
 redirect_honeypot:
-    //สลับ MAC Address
+    // สลับ MAC Address
     __builtin_memcpy(eth->h_dest, honeypot_mac, ETH_ALEN);
     __builtin_memcpy(eth->h_source, firewall_mac, ETH_ALEN);
 
-    return XDP_TX;
+    // ถ้า redirect ไม่สำเร็จ เป็น XDP_PASS
+    return bpf_redirect_map(&tx_port, 0, XDP_PASS);
 }
 
 char _license[] SEC("license") = "GPL";
