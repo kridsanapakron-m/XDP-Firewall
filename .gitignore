@@ -3,3 +3,4 @@
 xdp_lb_ctl
 *.sh
 *test*
+*.json

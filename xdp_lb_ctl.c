@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <linux/in.h>
 #include <bpf/bpf.h>
+#include <netinet/ether.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,19 +82,16 @@ static int parse_vip(char **arguments, struct vip_key *vip)
     return 0;
 }
 
-static int parse_mac(const char *text, __u8 mac[ETH_ALEN])
+static int parse_mac(const char *text, __u8 mac[ETH_ALEN], const char *name)
 {
-    unsigned int bytes[ETH_ALEN];
-    int consumed = 0;
+    struct ether_addr address;
 
-    if (sscanf(text, "%x:%x:%x:%x:%x:%x%n", &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4], &bytes[5], &consumed) != ETH_ALEN || text[consumed] != '\0')
+    if (!ether_aton_r(text, &address)) {
+        fprintf(stderr, "invalid %s: %s\n", name, text);
         return -1;
-
-    for (int i = 0; i < ETH_ALEN; i++) {
-        if (bytes[i] > 0xff)
-            return -1;
-        mac[i] = bytes[i];
     }
+
+    memcpy(mac, address.ether_addr_octet, ETH_ALEN);
     return 0;
 }
 
@@ -140,15 +138,16 @@ static int change_map(const char *path, const void *key, const void *value)
 
     result = value ? bpf_map_update_elem(fd, key, value, BPF_ANY)
                    : bpf_map_delete_elem(fd, key);
-    if (result && !value && errno == ENOENT) {
-        result = 0;
-    } else if (result) {
-        fprintf(stderr, "cannot %s %s: %s\n",
-                value ? "update" : "delete from", path, strerror(errno));
-    }
-
     close(fd);
-    return result;
+
+    if (!value && result == -ENOENT) /* deleting a missing key is fine */
+        return 0;
+    if (result) {
+        fprintf(stderr, "cannot %s %s: %s\n",
+                value ? "update" : "delete from", path, strerror(-result));
+        return -1;
+    }
+    return 0;
 }
 
 /* ------------------------------ Commands ----------------------------- */
@@ -184,16 +183,12 @@ static int delete_vip(char **arguments)
 static int set_backend(char **arguments)
 {
     struct backend backend = {};
-    struct backend_key backend_key = {};
+    struct backend_key backend_key;
 
-    if (parse_backend_key(arguments, &backend_key))
+    if (parse_backend_key(arguments, &backend_key) ||
+        parse_ipv4(arguments[4], &backend.address, "backend") ||
+        parse_mac(arguments[5], backend.mac, "backend MAC"))
         return -1;
-    if (parse_ipv4(arguments[4], &backend.address, "backend"))
-        return -1;
-    if (parse_mac(arguments[5], backend.mac)) {
-        fprintf(stderr, "invalid backend MAC: %s\n", arguments[5]);
-        return -1;
-    }
 
     /* A backend may be prepared before its VIP is activated. */
     return change_map(BACKEND_MAP_PATH, &backend_key, &backend);
@@ -201,7 +196,7 @@ static int set_backend(char **arguments)
 
 static int delete_backend(char **arguments)
 {
-    struct backend_key backend_key = {};
+    struct backend_key backend_key;
 
     if (parse_backend_key(arguments, &backend_key))
         return -1;
@@ -255,7 +250,6 @@ static const struct command *find_command(const char *name)
 int main(int argc, char **argv)
 {
     const struct command *command;
-    size_t argument_count;
 
     if (argc < 2) {
         usage(argv[0]);
@@ -263,13 +257,11 @@ int main(int argc, char **argv)
     }
 
     command = find_command(argv[1]);
-    argument_count = (size_t)(argc - 2);
-    if (!command || argument_count != command->argument_count ||
-        command->run(argv + 2)) {
+    if (!command || (size_t)(argc - 2) != command->argument_count) {
         usage(argv[0]);
         return 1;
     }
-    return 0;
+    return command->run(argv + 2) ? 1 : 0;
 }
 
 /*
