@@ -1,7 +1,6 @@
 #ifndef XDP_LB_COMMON_H
 #define XDP_LB_COMMON_H
 
-#include <linux/if_ether.h>
 #include <linux/types.h>
 
 #define MAX_BACKENDS_PER_VIP 64
@@ -25,8 +24,6 @@ struct backend_key {
 
 struct backend {
     __be32 address;
-    __u8 mac[ETH_ALEN];
-    __u8 padding[2];
 };
 
 struct device_config {

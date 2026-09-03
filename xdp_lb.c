@@ -1,4 +1,5 @@
 #include <linux/bpf.h>
+#include <linux/if_ether.h>
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <bpf/bpf_endian.h>
@@ -12,10 +13,9 @@
  * Load-balancer flow:
  *   parse -> reject fragments -> find VIP -> hash the 5-tuple
  *         -> find backend
- *         -> encapsulate with outer Ethernet + IPv4 -> redirect
+ *         -> encapsulate with IPv4-in-IPv4 -> redirect
  */
 
-#define ETHERIP_PROTOCOL 97
 #define IPV4_FAMILY 2
 #define DEFAULT_TTL 64
 #define IPV4_DF 0x4000
@@ -60,7 +60,9 @@ struct {
 
 /* ------------------------------- Parser ------------------------------ */
 
-static __always_inline int parse_client_packet(struct xdp_md *ctx, struct vip_key *vip, struct flow_key *flow)
+static __always_inline int
+parse_client_packet(struct xdp_md *ctx, struct vip_key *vip,
+                    struct flow_key *flow)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -81,7 +83,10 @@ static __always_inline int parse_client_packet(struct xdp_md *ctx, struct vip_ke
     ipv4_length = ipv4->ihl * 4;
     total_length = bpf_ntohs(ipv4->tot_len);
     available_length = data_end - (void *)ipv4;
-    if (ipv4->version != 4 || ipv4_length < sizeof(*ipv4) || total_length < ipv4_length || total_length > available_length)
+    if (ipv4->version != 4 ||
+        ipv4_length < sizeof(*ipv4) ||
+        total_length < ipv4_length ||
+        total_length > available_length)
         return -1;
 
     if (bpf_ntohs(ipv4->frag_off) & IPV4_FRAG_BITS)
@@ -124,7 +129,10 @@ static __always_inline __u32 flow_hash(const struct flow_key *flow)
     return mix_hash(hash, flow->protocol);
 }
 
-static __always_inline struct backend *select_backend(const struct vip_key *vip, const struct vip_value *vip_value, const struct flow_key *flow)
+static __always_inline struct backend *
+select_backend(const struct vip_key *vip,
+               const struct vip_value *vip_value,
+               const struct flow_key *flow)
 {
     struct backend_key key = {};
     __u32 backend_count = vip_value->backend_count;
@@ -151,7 +159,9 @@ static __always_inline __sum16 ipv4_checksum(const struct iphdr *ipv4)
     return ~sum;
 }
 
-static __always_inline void build_outer_ipv4(struct iphdr *ipv4, __u16 total_length, __be32 source, __be32 destination)
+static __always_inline void
+build_outer_ipv4(struct iphdr *ipv4, __u16 total_length,
+                 __be32 source, __be32 destination)
 {
     ipv4->version = 4;
     ipv4->ihl = sizeof(*ipv4) / 4;
@@ -160,33 +170,48 @@ static __always_inline void build_outer_ipv4(struct iphdr *ipv4, __u16 total_len
     ipv4->id = 0;
     ipv4->frag_off = bpf_htons(IPV4_DF);
     ipv4->ttl = DEFAULT_TTL;
-    ipv4->protocol = ETHERIP_PROTOCOL;
+    ipv4->protocol = IPPROTO_IPIP;
     ipv4->saddr = source;
     ipv4->daddr = destination;
     ipv4->check = 0;
     ipv4->check = ipv4_checksum(ipv4);
 }
 
-static __always_inline int encapsulate_packet(struct xdp_md *ctx, const struct device_config *device, const struct backend *backend, struct bpf_fib_lookup *route, int *failure_action)
+static __always_inline int
+encapsulate_packet(struct xdp_md *ctx,
+                   const struct device_config *device,
+                   const struct backend *backend,
+                   struct bpf_fib_lookup *route,
+                   int *failure_action)
 {
-    const int headers_size = sizeof(struct ethhdr) + sizeof(struct iphdr);
+    const int added_size = sizeof(struct iphdr);
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    __u32 inner_size = data_end - data;
-    __u32 outer_ip_size = sizeof(struct iphdr) + inner_size;
+    struct ethhdr *ethernet = data;
+    struct iphdr *inner_ipv4;
+    __u32 inner_size;
+    __u32 outer_ip_size;
     struct ethhdr *outer_ethernet;
     struct iphdr *outer_ipv4;
-    struct ethhdr *inner_ethernet;
     int fib_result;
 
     *failure_action = XDP_PASS;
 
-    if (inner_size < sizeof(struct ethhdr) + sizeof(struct iphdr) || outer_ip_size > 0xffff)
+    if ((void *)(ethernet + 1) > data_end)
         return ENCAPSULATION_FAILED;
+
+    inner_ipv4 = (void *)(ethernet + 1);
+    if ((void *)(inner_ipv4 + 1) > data_end)
+        return ENCAPSULATION_FAILED;
+
+    inner_size = bpf_ntohs(inner_ipv4->tot_len);
+    if (inner_size > 0xffff - sizeof(struct iphdr))
+        return ENCAPSULATION_FAILED;
+    outer_ip_size = sizeof(struct iphdr) + inner_size;
 
     route->family = IPV4_FAMILY;
     route->ifindex = ctx->ingress_ifindex;
-    route->l4_protocol = ETHERIP_PROTOCOL;
+    route->l4_protocol = IPPROTO_IPIP;
     route->tot_len = outer_ip_size;
     route->ipv4_src = device->ip_address;
     route->ipv4_dst = backend->address;
@@ -197,16 +222,17 @@ static __always_inline int encapsulate_packet(struct xdp_md *ctx, const struct d
     if (fib_result != BPF_FIB_LKUP_RET_SUCCESS)
         return ENCAPSULATION_FAILED;
 
-    if (bpf_xdp_adjust_head(ctx, -headers_size))
+    /* The old Ethernet header becomes the tail of the new outer IPv4. */
+    if (bpf_xdp_adjust_head(ctx, -added_size))
         return ENCAPSULATION_FAILED;
 
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     outer_ethernet = data;
     outer_ipv4 = (void *)(outer_ethernet + 1);
-    inner_ethernet = (void *)(outer_ipv4 + 1);
+    inner_ipv4 = (void *)(outer_ipv4 + 1);
 
-    if ((void *)(inner_ethernet + 1) > data_end) {
+    if ((void *)(inner_ipv4 + 1) > data_end) {
         *failure_action = XDP_DROP;
         return ENCAPSULATION_FAILED;
     }
@@ -214,8 +240,6 @@ static __always_inline int encapsulate_packet(struct xdp_md *ctx, const struct d
     __builtin_memcpy(outer_ethernet->h_source, route->smac, ETH_ALEN);
     __builtin_memcpy(outer_ethernet->h_dest, route->dmac, ETH_ALEN);
     outer_ethernet->h_proto = bpf_htons(ETH_P_IP);
-    __builtin_memcpy(inner_ethernet->h_source, route->smac, ETH_ALEN);
-    __builtin_memcpy(inner_ethernet->h_dest, backend->mac, ETH_ALEN);
 
     build_outer_ipv4(outer_ipv4, outer_ip_size, device->ip_address, backend->address);
 
