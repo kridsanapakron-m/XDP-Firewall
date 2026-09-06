@@ -113,6 +113,20 @@ static int parse_ipv4(const char *text, __be32 *address, const char *name)
     return -1;
 }
 
+static int parse_toggle(const char *text, __u32 *value, const char *name)
+{
+    if (!strcmp(text, "on")) {
+        *value = 1;
+        return 0;
+    }
+    if (!strcmp(text, "off")) {
+        *value = 0;
+        return 0;
+    }
+    fprintf(stderr, "invalid %s: %s (expected on/off)\n", name, text);
+    return -1;
+}
+
 static int parse_vip(char **arguments, struct vip_key *vip)
 {
     memset(vip, 0, sizeof(*vip));
@@ -232,6 +246,7 @@ static int delete_backend(char **arguments)
     return change_map(BACKEND_MAP_PATH, &backend_key, NULL);
 }
 
+/* Also resets fragment_handling_enabled to off; re-enable it afterward. */
 static int set_device_ip(char **arguments)
 {
     struct device_config device = {};
@@ -242,8 +257,41 @@ static int set_device_ip(char **arguments)
     return change_map(DEVICE_IP_MAP_PATH, &key, &device);
 }
 
+static int set_fragment_handling(char **arguments)
+{
+    struct device_config device = {};
+    __u32 key = 0;
+    __u32 enabled;
+    int fd;
+    int result;
+
+    if (parse_toggle(arguments[0], &enabled, "fragment handling"))
+        return -1;
+
+    fd = open_map(DEVICE_IP_MAP_PATH);
+    if (fd < 0)
+        return -1;
+
+    if (bpf_map_lookup_elem(fd, &key, &device)) {
+        fprintf(stderr, "device IP is not configured yet; run set-device-ip first\n");
+        close(fd);
+        return -1;
+    }
+
+    device.fragment_handling_enabled = enabled;
+    result = bpf_map_update_elem(fd, &key, &device, BPF_ANY);
+    close(fd);
+
+    if (result) {
+        fprintf(stderr, "cannot update %s: %s\n", DEVICE_IP_MAP_PATH, strerror(-result));
+        return -1;
+    }
+    return 0;
+}
+
 static int apply_config(char **arguments)
 {
+    /* Zero-init leaves fragment_handling_enabled off; enable it explicitly. */
     struct device_config device = {};
     __u32 device_key = 0;
 
@@ -315,6 +363,7 @@ static const struct command commands[] = {
     { "set-backend", "<vip_ip> <port> <tcp|udp> <slot> <backend_ip>", 5, set_backend },
     { "del-backend", "<vip_ip> <port> <tcp|udp> <slot>", 4, delete_backend },
     { "set-device-ip", "<device_ip>", 1, set_device_ip },
+    { "set-fragment-handling", "<on|off>", 1, set_fragment_handling },
 };
 
 static void usage(const char *program)
