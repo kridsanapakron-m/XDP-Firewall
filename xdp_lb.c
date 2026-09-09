@@ -11,7 +11,9 @@
  * XDP DSR load balance
  *
  * Load-balancer flow:
- *   parse -> reject fragments -> find VIP -> hash the 5-tuple
+ *   parse -> detect fragments -> find VIP -> hash
+                -> if later frag first -> store backend in frag cache
+                    else first frag -> make it to sample backend -> store backend in frag cache
  *         -> find backend
  *         -> encapsulate with IPv4-in-IPv4 -> redirect
  */
@@ -25,11 +27,10 @@
 #define ENCAPSULATION_FAILED 0
 #define ENCAPSULATION_SUCCESS 1
 
-/* parse_client_packet() outcomes for the non-zero (failure) cases. */
 #define PARSE_RESULT_UNSUPPORTED -1
-#define PARSE_RESULT_FRAGMENT -2
+#define PARSE_RESULT_FRAGMENT_FIRST -2
+#define PARSE_RESULT_FRAGMENT_LATER -3
 
-/* handle_first_fragment()/handle_later_fragment() outcomes. */
 #define FRAGMENT_RESULT_PASS 0
 #define FRAGMENT_RESULT_FOUND 1
 #define FRAGMENT_RESULT_DROP 2
@@ -77,6 +78,11 @@ struct {
 
 /* ------------------------------- Parser ------------------------------ */
 
+static __always_inline int is_first_fragment(const struct iphdr *ipv4)
+{
+    return (bpf_ntohs(ipv4->frag_off) & IPV4_FRAG_OFFSET_MASK) == 0;
+}
+
 static __always_inline int
 parse_client_packet(struct xdp_md *ctx, struct vip_key *vip,
                     struct flow_key *flow, struct iphdr **out_ipv4)
@@ -89,6 +95,7 @@ parse_client_packet(struct xdp_md *ctx, struct vip_key *vip,
     __u32 ipv4_length;
     __u32 total_length;
     __u32 available_length;
+    int is_fragment;
 
     if ((void *)(ethernet + 1) > data_end || ethernet->h_proto != bpf_htons(ETH_P_IP))
         return PARSE_RESULT_UNSUPPORTED;
@@ -106,13 +113,11 @@ parse_client_packet(struct xdp_md *ctx, struct vip_key *vip,
         total_length > available_length)
         return PARSE_RESULT_UNSUPPORTED;
 
-    /* Fragments have no stable L4 offset; hand the validated header back
-     * so the caller can classify and cache it without reparsing Ethernet.
-     */
     *out_ipv4 = ipv4;
+    is_fragment = bpf_ntohs(ipv4->frag_off) & IPV4_FRAG_BITS;
 
-    if (bpf_ntohs(ipv4->frag_off) & IPV4_FRAG_BITS)
-        return PARSE_RESULT_FRAGMENT;
+    if (is_fragment && !is_first_fragment(ipv4))
+        return PARSE_RESULT_FRAGMENT_LATER;
 
     if (ipv4->protocol != IPPROTO_TCP && ipv4->protocol != IPPROTO_UDP)
         return PARSE_RESULT_UNSUPPORTED;
@@ -131,15 +136,10 @@ parse_client_packet(struct xdp_md *ctx, struct vip_key *vip,
     flow->source_port = ports->source;
     flow->destination_port = ports->destination;
     flow->protocol = ipv4->protocol;
-    return 0;
+    return is_fragment ? PARSE_RESULT_FRAGMENT_FIRST : 0;
 }
 
 /* --------------------------- Fragment cache --------------------------- */
-
-static __always_inline int is_first_fragment(const struct iphdr *ipv4)
-{
-    return (bpf_ntohs(ipv4->frag_off) & IPV4_FRAG_OFFSET_MASK) == 0;
-}
 
 static __always_inline void
 parse_fragment_key(const struct iphdr *ipv4, struct frag_key *key)
@@ -183,53 +183,17 @@ select_backend(const struct vip_key *vip,
     return bpf_map_lookup_elem(&backend_map, &key);
 }
 
-/*
- * First fragment: same VIP/backend selection as a normal packet, then try to
- * become the datagram's cache owner with a single atomic insert. Losing the
- * insert race is resolved by re-reading whatever committed first.
- */
 static __always_inline int
-handle_first_fragment(struct xdp_md *ctx, const struct iphdr *ipv4,
-                      const struct frag_key *key, struct backend *out_backend)
+handle_first_fragment(const struct frag_key *key, const struct flow_key *flow,
+                      __be32 backend_address, struct backend *out_backend)
 {
-    void *data_end = (void *)(long)ctx->data_end;
-    struct layer4_ports *ports;
-    struct vip_key vip_key = {};
-    struct vip_value *vip;
-    struct backend *selected;
-    struct flow_key flow = {};
     struct frag_entry candidate = {};
     struct frag_entry *existing;
-    __u32 ipv4_length = ipv4->ihl * 4;
-    __u32 total_length = bpf_ntohs(ipv4->tot_len);
-    __u64 now;
+    __u64 now = bpf_ktime_get_ns();
 
-    ports = (void *)ipv4 + ipv4_length;
-    if (ipv4_length + sizeof(*ports) > total_length || (void *)(ports + 1) > data_end)
-        return FRAGMENT_RESULT_PASS;
-
-    vip_key.address = ipv4->daddr;
-    vip_key.port = ports->destination;
-    vip_key.protocol = ipv4->protocol;
-
-    vip = bpf_map_lookup_elem(&vip_map, &vip_key);
-    if (!vip)
-        return FRAGMENT_RESULT_PASS;
-
-    flow.source_address = ipv4->saddr;
-    flow.destination_address = ipv4->daddr;
-    flow.source_port = ports->source;
-    flow.destination_port = ports->destination;
-    flow.protocol = ipv4->protocol;
-
-    selected = select_backend(&vip_key, vip, &flow);
-    if (!selected)
-        return FRAGMENT_RESULT_PASS;
-
-    now = bpf_ktime_get_ns();
-    candidate.backend_address = selected->address;
-    candidate.source_port = ports->source;
-    candidate.destination_port = ports->destination;
+    candidate.backend_address = backend_address;
+    candidate.source_port = flow->source_port;
+    candidate.destination_port = flow->destination_port;
     candidate.expires_at_ns = now + FRAG_TIMEOUT_NS;
 
     if (!bpf_map_update_elem(&frag_cache_map, key, &candidate, BPF_NOEXIST)) {
@@ -348,7 +312,6 @@ encapsulate_packet(struct xdp_md *ctx,
     if (fib_result != BPF_FIB_LKUP_RET_SUCCESS)
         return ENCAPSULATION_FAILED;
 
-    /* The old Ethernet header becomes the tail of the new outer IPv4. */
     if (bpf_xdp_adjust_head(ctx, -added_size))
         return ENCAPSULATION_FAILED;
 
@@ -392,33 +355,30 @@ int xdp_lb_main(struct xdp_md *ctx)
     struct iphdr *ipv4 = NULL;
     __u32 device_ip_key = DEVICE_IP_KEY;
     int failure_action;
-    int parse_result = parse_client_packet(ctx, &vip_key, &flow, &ipv4);
+    int parse_result;
 
-    if (parse_result == PARSE_RESULT_FRAGMENT) {
+    device = bpf_map_lookup_elem(&device_ip_map, &device_ip_key);
+    if (!device || !device->ip_address)
+        return XDP_PASS;
+
+    parse_result = parse_client_packet(ctx, &vip_key, &flow, &ipv4);
+    if (parse_result == PARSE_RESULT_UNSUPPORTED)
+        return XDP_PASS;
+
+    if (parse_result != 0 && !device->fragment_handling_enabled)
+        return XDP_PASS;
+
+    if (parse_result == PARSE_RESULT_FRAGMENT_LATER) {
         struct frag_key key = {};
         int fragment_result;
 
-        device = bpf_map_lookup_elem(&device_ip_map, &device_ip_key);
-        if (!device || !device->ip_address || !device->fragment_handling_enabled)
-            return XDP_PASS;
-
         parse_fragment_key(ipv4, &key);
-
-        if (is_first_fragment(ipv4))
-            fragment_result = handle_first_fragment(ctx, ipv4, &key, &fragment_backend);
-        else
-            fragment_result = handle_later_fragment(&key, &fragment_backend);
-
-        if (fragment_result == FRAGMENT_RESULT_DROP)
-            return XDP_DROP;
+        fragment_result = handle_later_fragment(&key, &fragment_backend);
         if (fragment_result != FRAGMENT_RESULT_FOUND)
             return XDP_PASS;
 
         backend = &fragment_backend;
     } else {
-        if (parse_result)
-            return XDP_PASS;
-
         vip = bpf_map_lookup_elem(&vip_map, &vip_key);
         if (!vip)
             return XDP_PASS;
@@ -427,9 +387,19 @@ int xdp_lb_main(struct xdp_md *ctx)
         if (!backend)
             return XDP_PASS;
 
-        device = bpf_map_lookup_elem(&device_ip_map, &device_ip_key);
-        if (!device || !device->ip_address)
-            return XDP_PASS;
+        if (parse_result == PARSE_RESULT_FRAGMENT_FIRST) {
+            struct frag_key key = {};
+            int fragment_result;
+
+            parse_fragment_key(ipv4, &key);
+            fragment_result = handle_first_fragment(&key, &flow, backend->address, &fragment_backend);
+            if (fragment_result == FRAGMENT_RESULT_DROP)
+                return XDP_DROP;
+            if (fragment_result != FRAGMENT_RESULT_FOUND)
+                return XDP_PASS;
+
+            backend = &fragment_backend;
+        }
     }
 
     if (encapsulate_packet(ctx, device, backend, &route, &failure_action) == ENCAPSULATION_FAILED)
