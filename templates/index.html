@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XDP DDoS Protection</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:        #0F1420;
+    --panel:     #171E2C;
+    --panel-2:   #1D2536;
+    --line:      #2B3448;
+    --text:      #E7EAF2;
+    --muted:     #8992A8;
+    --flow:      #4FB4A8;   /* traffic passing normally */
+    --flow-dim:  #2B4A46;
+    --block:     #D9584A;   /* blocked / danger */
+    --block-dim: #4A2C29;
+    --warn:      #E0A458;   /* pending / attention */
+    --focus:     #6FA8DC;
+    --radius:    3px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:"IBM Plex Sans Thai","IBM Plex Mono",ui-sans-serif,system-ui,sans-serif;
+    font-size:14px;
+    line-height:1.5;
+    min-height:100vh;
+  }
+  .mono{font-family:"IBM Plex Mono",ui-monospace,monospace;}
+  a{color:inherit;}
+
+  /* ---------- shell ---------- */
+  .shell{max-width:1280px;margin:0 auto;padding:28px 24px 64px;}
+
+  header.top{
+    display:flex;align-items:flex-end;justify-content:space-between;
+    gap:24px;flex-wrap:wrap;
+    border-bottom:1px solid var(--line);
+    padding-bottom:18px;margin-bottom:24px;
+  }
+  header.top h1{
+    font-size:22px;font-weight:600;margin:0 0 4px;letter-spacing:.2px;
+  }
+  header.top p{margin:0;color:var(--muted);font-size:13px;}
+  .pulse-dot{
+    display:inline-block;width:7px;height:7px;border-radius:50%;
+    background:var(--flow);margin-right:7px;position:relative;top:-1px;
+    box-shadow:0 0 0 0 rgba(79,180,168,.6);
+    animation:pulse 2s infinite;
+  }
+  @keyframes pulse{
+    0%{box-shadow:0 0 0 0 rgba(79,180,168,.45);}
+    70%{box-shadow:0 0 0 6px rgba(79,180,168,0);}
+    100%{box-shadow:0 0 0 0 rgba(79,180,168,0);}
+  }
+  @media (prefers-reduced-motion: reduce){
+    .pulse-dot{animation:none;}
+  }
+
+  /* ---------- interface flow bar ---------- */
+  .ifacebar{
+    display:grid;grid-template-columns:1fr auto 1fr;align-items:center;
+    gap:18px;background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius);padding:16px 20px;margin-bottom:22px;
+  }
+  .iface-node{min-width:0;}
+  .iface-node .name{font-size:15px;font-weight:600;}
+  .iface-node .mac{color:var(--muted);font-size:12.5px;margin-top:2px;word-break:break-all;}
+  .iface-node.right{text-align:right;}
+  .flow-mid{display:flex;flex-direction:column;align-items:center;color:var(--muted);font-size:11.5px;gap:4px;}
+  .flow-arrow{width:120px;height:2px;background:linear-gradient(90deg,var(--line),var(--flow),var(--line));position:relative;}
+  .flow-arrow::after{
+    content:"";position:absolute;right:-1px;top:-3px;
+    border:4px solid transparent;border-left-color:var(--flow);
+  }
+  .txport-btn{margin-top:2px;}
+
+  /* ---------- generic panel ---------- */
+  .panel{
+    background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius);padding:18px 20px;margin-bottom:22px;
+  }
+  .panel h2{
+    font-size:14px;font-weight:600;margin:0 0 14px;
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+  }
+  .panel h2 .sub{font-weight:400;color:var(--muted);font-size:12px;}
+
+  /* ---------- global mac config ---------- */
+  .global-grid{display:grid;grid-template-columns:1fr 1fr auto;gap:14px;align-items:end;}
+  @media (max-width:700px){.global-grid{grid-template-columns:1fr;}}
+
+  .field{display:flex;flex-direction:column;gap:6px;}
+  .field label{font-size:12px;color:var(--muted);}
+  input[type=text], input[type=number]{
+    background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+    border-radius:var(--radius);padding:8px 10px;font-size:13px;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    width:100%;
+  }
+  input:focus-visible, button:focus-visible, .switch input:focus-visible + .track{
+    outline:2px solid var(--focus);outline-offset:1px;
+  }
+
+  button{
+    font-family:inherit;font-size:13px;cursor:pointer;
+    border-radius:var(--radius);padding:8px 14px;border:1px solid var(--line);
+    background:var(--panel-2);color:var(--text);transition:border-color .15s;
+  }
+  button:hover{border-color:var(--focus);}
+  button.primary{background:var(--flow-dim);border-color:var(--flow);color:#CFEFEA;}
+  button.primary:hover{background:var(--flow);color:#0F1420;}
+  button.danger{background:var(--block-dim);border-color:var(--block);color:#FBD9D4;}
+  button.danger:hover{background:var(--block);color:#1a0d0b;}
+  button.small{padding:5px 10px;font-size:12px;}
+  button:disabled{opacity:.45;cursor:default;}
+
+  /* ---------- protocol cards ---------- */
+  .proto-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;}
+  @media (max-width:980px){.proto-grid{grid-template-columns:repeat(2,1fr);}}
+  @media (max-width:560px){.proto-grid{grid-template-columns:1fr;}}
+
+  .proto-card{
+    background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);
+    padding:14px;display:flex;flex-direction:column;gap:10px;
+  }
+  .proto-card.disabled{opacity:.55;}
+  .proto-head{display:flex;align-items:center;justify-content:space-between;}
+  .proto-head .pname{font-weight:600;font-size:14px;font-family:"IBM Plex Mono",monospace;}
+
+  .switch{position:relative;display:inline-block;width:34px;height:19px;flex:none;}
+  .switch input{opacity:0;width:0;height:0;position:absolute;}
+  .switch .track{
+    position:absolute;inset:0;background:var(--line);border-radius:20px;
+    transition:background .15s;cursor:pointer;
+  }
+  .switch .track::before{
+    content:"";position:absolute;width:14px;height:14px;left:2.5px;top:2.5px;
+    background:var(--muted);border-radius:50%;transition:transform .15s,background .15s;
+  }
+  .switch input:checked + .track{background:var(--flow-dim);border:1px solid var(--flow);}
+  .switch input:checked + .track::before{transform:translateX(15px);background:var(--flow);}
+
+  .proto-card .field label{display:flex;justify-content:space-between;}
+  .proto-card .field label .unit{color:#5B647A;}
+  .proto-card .save-row{display:flex;justify-content:flex-end;margin-top:2px;}
+
+  /* ---------- stats table ---------- */
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  thead th{
+    text-align:left;color:var(--muted);font-weight:500;font-size:11.5px;
+    padding:0 10px 8px;border-bottom:1px solid var(--line);
+  }
+  tbody td{padding:9px 10px;border-bottom:1px solid #1F2738;vertical-align:middle;}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr.blocked{background:rgba(217,88,74,.06);}
+  .ip-cell{font-family:"IBM Plex Mono",monospace;}
+  .status-pill{
+    display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:20px;
+    font-size:11.5px;border:1px solid transparent;
+  }
+  .status-pill.ok{background:rgba(79,180,168,.12);color:var(--flow);border-color:rgba(79,180,168,.35);}
+  .status-pill.blocked{background:rgba(217,88,74,.14);color:#F0958A;border-color:rgba(217,88,74,.4);}
+  .proto-tag{
+    font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--muted);
+    background:var(--panel-2);border:1px solid var(--line);border-radius:3px;padding:1px 6px;
+  }
+  .empty-row td{text-align:center;color:var(--muted);padding:28px 0;}
+
+  /* ---------- log ---------- */
+  .log-list{max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:0;}
+  .log-row{
+    display:grid;grid-template-columns:120px 1fr 1fr auto;gap:10px;
+    padding:8px 4px;border-bottom:1px solid #1F2738;font-size:12.5px;align-items:center;
+  }
+  .log-row:last-child{border-bottom:none;}
+  .log-row .t{color:var(--muted);font-family:"IBM Plex Mono",monospace;}
+  .log-row .res{font-family:"IBM Plex Mono",monospace;text-align:right;}
+  .log-row .res.success{color:var(--flow);}
+  .log-row .res.other{color:var(--warn);}
+
+  .toast{
+    position:fixed;right:20px;bottom:20px;background:var(--panel-2);
+    border:1px solid var(--line);border-left:3px solid var(--flow);
+    color:var(--text);padding:10px 16px;border-radius:var(--radius);
+    font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.35);
+    opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;
+    pointer-events:none;z-index:50;max-width:340px;
+  }
+  .toast.show{opacity:1;transform:translateY(0);}
+  .toast.error{border-left-color:var(--block);}
+
+  .foot-note{color:#5B647A;font-size:11.5px;margin-top:6px;}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="top">
+    <div>
+      <h1><span class="pulse-dot"></span>XDP DDoS Protection</h1>
+      <p>แผงควบคุมสำหรับทดสอบ eBPF/XDP rate-limit &amp; redirect-to-honeypot</p>
+    </div>
+    <div class="foot-note" id="clockLine">—</div>
+  </header>
+
+  <div class="ifacebar">
+    <div class="iface-node">
+      <div class="name" id="inIfName">{{ in_if }}</div>
+      <div class="mac" id="inIfMac">อ่านค่า MAC…</div>
+    </div>
+    <div class="flow-mid">
+      <div class="flow-arrow"></div>
+      <span>รับทราฟฟิกเข้า → ตรวจ rate limit</span>
+      <button class="small txport-btn" id="btnTxPort">ตั้งค่า tx_port ใหม่</button>
+    </div>
+    <div class="iface-node right">
+      <div class="name" id="outIfName">{{ out_if }}</div>
+      <div class="mac" id="outIfMac">อ่านค่า MAC…</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Global config <span class="sub">honeypot / firewall MAC สำหรับ redirect</span></h2>
+    <div class="global-grid">
+      <div class="field">
+        <label for="hpMac">honeypot_mac</label>
+        <input type="text" id="hpMac" class="mono" placeholder="aa:bb:cc:dd:ee:ff">
+      </div>
+      <div class="field">
+        <label for="fwMac">firewall_mac</label>
+        <input type="text" id="fwMac" class="mono" placeholder="aa:bb:cc:dd:ee:ff">
+      </div>
+      <div class="field">
+        <button class="primary" id="btnSaveGlobal">บันทึก global config</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Protocol thresholds <span class="sub">ต่อโปรโตคอล — index 0 (other) คือค่า fallback</span></h2>
+    <div class="proto-grid" id="protoGrid"></div>
+  </div>
+
+  <div class="panel">
+    <h2>
+      Live rate map
+      <span class="sub" id="statsSummary">กำลังโหลด…</span>
+    </h2>
+    <table>
+      <thead>
+        <tr>
+          <th>IP</th>
+          <th>โปรโตคอล</th>
+          <th>Packet count</th>
+          <th>สถานะ</th>
+          <th>เห็นล่าสุด</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="statsBody">
+        <tr class="empty-row"><td colspan="6">กำลังโหลดข้อมูล…</td></tr>
+      </tbody>
+    </table>
+    <div style="display:flex;justify-content:flex-end;margin-top:14px;">
+      <button class="danger small" id="btnClearAll">ล้าง rate map ทั้งหมด</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Unban log <span class="sub">ล่าสุด 200 รายการ</span></h2>
+    <div class="log-list" id="logList">
+      <div class="foot-note" style="padding:8px 4px;">ยังไม่มีข้อมูล</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const PROTOCOLS = ["tcp", "udp", "icmp", "other"];
+let config = null;          // full config object mirrored from /api/config
+let statsTimer = null;
+let logTimer = null;
+
+// ---------- small helpers ----------
+function toast(msg, isError){
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.toggle("error", !!isError);
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 3200);
+}
+
+async function api(method, url, body){
+  const opts = { method, headers: {} };
+  if (body !== undefined){
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function fmtSeconds(s){
+  if (s < 1) return `${Math.round(s*1000)} ms`;
+  if (s < 60) return `${s.toFixed(1)} s`;
+  const m = Math.floor(s/60), sec = Math.round(s%60);
+  return `${m}m ${sec}s`;
+}
+
+function updateClock(){
+  document.getElementById("clockLine").textContent =
+    new Date().toLocaleString("th-TH", { hour12:false });
+}
+
+// ---------- interfaces ----------
+async function loadInterfaces(){
+  try{
+    const d = await api("GET", "/api/interfaces");
+    document.getElementById("inIfName").textContent = d.in_if;
+    document.getElementById("outIfName").textContent = d.out_if;
+    document.getElementById("inIfMac").textContent = d.in_mac;
+    document.getElementById("outIfMac").textContent = `${d.out_mac}  ·  ifindex ${d.out_ifindex}`;
+  }catch(e){
+    toast(`โหลด interfaces ไม่สำเร็จ: ${e.message}`, true);
+  }
+}
+
+document.getElementById("btnTxPort").addEventListener("click", async () => {
+  try{
+    const d = await api("POST", "/api/txport");
+    toast(`ตั้งค่า tx_port เป็น ifindex ${d.ifindex} แล้ว`);
+  }catch(e){
+    toast(`ตั้งค่า tx_port ไม่สำเร็จ: ${e.message}`, true);
+  }
+});
+
+// ---------- config (global + protocols) ----------
+async function loadConfig(){
+  try{
+    config = await api("GET", "/api/config");
+    document.getElementById("hpMac").value = config.global.honeypot_mac;
+    document.getElementById("fwMac").value = config.global.firewall_mac;
+    renderProtoCards();
+  }catch(e){
+    toast(`โหลด config ไม่สำเร็จ: ${e.message}`, true);
+  }
+}
+
+async function pushConfig(successMsg){
+  try{
+    const d = await api("POST", "/api/config", config);
+    config = d.config;
+    renderProtoCards();
+    document.getElementById("hpMac").value = config.global.honeypot_mac;
+    document.getElementById("fwMac").value = config.global.firewall_mac;
+    toast(successMsg || "บันทึกสำเร็จ");
+  }catch(e){
+    toast(`บันทึกไม่สำเร็จ: ${e.message}`, true);
+  }
+}
+
+document.getElementById("btnSaveGlobal").addEventListener("click", () => {
+  if (!config) return;
+  config.global.honeypot_mac = document.getElementById("hpMac").value.trim();
+  config.global.firewall_mac = document.getElementById("fwMac").value.trim();
+  pushConfig("บันทึก global config แล้ว");
+});
+
+function protoCardHtml(name, c){
+  return `
+    <div class="proto-card${c.enabled ? "" : " disabled"}" data-proto="${name}">
+      <div class="proto-head">
+        <span class="pname">${name}</span>
+        <label class="switch">
+          <input type="checkbox" data-field="enabled" ${c.enabled ? "checked" : ""}>
+          <span class="track"></span>
+        </label>
+      </div>
+      <div class="field">
+        <label>threshold <span class="unit">pkt/window</span></label>
+        <input type="number" min="0" data-field="threshold" value="${c.threshold}">
+      </div>
+      <div class="field">
+        <label>time_window <span class="unit">ms</span></label>
+        <input type="number" min="0" step="0.1" data-field="time_window_ms" value="${c.time_window_ms}">
+      </div>
+      <div class="field">
+        <label>block_duration <span class="unit">s</span></label>
+        <input type="number" min="0" step="0.1" data-field="block_duration_s" value="${c.block_duration_s}">
+      </div>
+      <div class="save-row">
+        <button class="small primary" data-save="${name}">บันทึก</button>
+      </div>
+    </div>`;
+}
+
+function renderProtoCards(){
+  const grid = document.getElementById("protoGrid");
+  grid.innerHTML = PROTOCOLS.map(name => protoCardHtml(name, config.protocols[name])).join("");
+
+  grid.querySelectorAll(".proto-card").forEach(card => {
+    const name = card.dataset.proto;
+    card.querySelectorAll("[data-field]").forEach(input => {
+      input.addEventListener("change", () => {
+        const field = input.dataset.field;
+        config.protocols[name][field] =
+          field === "enabled" ? input.checked : parseFloat(input.value);
+        card.classList.toggle("disabled", !config.protocols[name].enabled);
+      });
+    });
+  });
+
+  grid.querySelectorAll("[data-save]").forEach(btn => {
+    btn.addEventListener("click", () => pushConfig(`บันทึกค่า ${btn.dataset.save.toUpperCase()} แล้ว`));
+  });
+}
+
+// ---------- live stats ----------
+async function loadStats(){
+  try{
+    const rows = await api("GET", "/api/stats");
+    const body = document.getElementById("statsBody");
+    const blockedCount = rows.filter(r => r.blocked).length;
+    document.getElementById("statsSummary").textContent =
+      `${rows.length} flow · ${blockedCount} ถูกบล็อกอยู่`;
+
+    if (!rows.length){
+      body.innerHTML = `<tr class="empty-row"><td colspan="6">ยังไม่มีทราฟฟิกเข้ามาตรงเงื่อนไข</td></tr>`;
+      return;
+    }
+
+    body.innerHTML = rows.map(r => `
+      <tr class="${r.blocked ? "blocked" : ""}">
+        <td class="ip-cell">${r.ip}</td>
+        <td><span class="proto-tag">${r.proto_name}</span></td>
+        <td class="mono">${r.packet_count}</td>
+        <td>
+          ${r.blocked
+            ? `<span class="status-pill blocked">บล็อกอยู่ · เหลือ ${fmtSeconds(r.blocked_remaining_s)}</span>`
+            : `<span class="status-pill ok">ปกติ</span>`}
+        </td>
+        <td class="foot-note">${fmtSeconds(r.last_seen_s_ago)} ที่แล้ว</td>
+        <td style="text-align:right;">
+          <button class="small" data-unblock="${r.ip}" data-proto="${r.proto}">ปลดบล็อก</button>
+        </td>
+      </tr>`).join("");
+
+    body.querySelectorAll("[data-unblock]").forEach(btn => {
+      btn.addEventListener("click", () => unblock(btn.dataset.unblock, Number(btn.dataset.proto)));
+    });
+  }catch(e){
+    toast(`โหลด stats ไม่สำเร็จ: ${e.message}`, true);
+  }
+}
+
+async function unblock(ip, proto){
+  try{
+    const d = await api("POST", "/api/unblock", { ip, proto });
+    toast(d.deleted ? `ปลดบล็อก ${ip} แล้ว` : `ไม่พบ ${ip} ใน rate map`);
+    loadStats();
+    loadLog();
+  }catch(e){
+    toast(`ปลดบล็อกไม่สำเร็จ: ${e.message}`, true);
+  }
+}
+
+document.getElementById("btnClearAll").addEventListener("click", async () => {
+  if (!confirm("ล้างข้อมูลใน rate_limit_map ทั้งหมด? การกระทำนี้ย้อนกลับไม่ได้")) return;
+  try{
+    await api("POST", "/api/clear");
+    toast("ล้าง rate map ทั้งหมดแล้ว");
+    loadStats();
+  }catch(e){
+    toast(`ล้างไม่สำเร็จ: ${e.message}`, true);
+  }
+});
+
+// ---------- unban log ----------
+async function loadLog(){
+  try{
+    const rows = await api("GET", "/api/unban_log");
+    const list = document.getElementById("logList");
+    if (!rows.length){
+      list.innerHTML = `<div class="foot-note" style="padding:8px 4px;">ยังไม่มีข้อมูล</div>`;
+      return;
+    }
+    list.innerHTML = rows.map(r => `
+      <div class="log-row">
+        <span class="t">${r.time}</span>
+        <span class="ip-cell">${r.ip}</span>
+        <span class="foot-note">${r.source}</span>
+        <span class="res ${r.result === "success" ? "success" : "other"}">${r.result}</span>
+      </div>`).join("");
+  }catch(e){
+    toast(`โหลด log ไม่สำเร็จ: ${e.message}`, true);
+  }
+}
+
+// ---------- boot ----------
+(async function init(){
+  updateClock();
+  setInterval(updateClock, 1000);
+  await loadInterfaces();
+  await loadConfig();
+  await loadStats();
+  await loadLog();
+  statsTimer = setInterval(loadStats, 2000);
+  logTimer = setInterval(loadLog, 4000);
+})();
+</script>
+</body>
+</html>
