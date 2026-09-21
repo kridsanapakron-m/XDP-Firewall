@@ -4,3 +4,4 @@ xdp_lb_ctl
 *.sh
 *test*
 *.json
+xdp_lb_conf

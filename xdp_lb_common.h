@@ -33,6 +33,16 @@ struct backend {
 struct device_config {
     __be32 ip_address;
     __u32 fragment_handling_enabled;
+    __u32 icmp_pmtu_enabled;
+};
+
+/* Per-CPU rate-limit window and counters for ICMP "fragmentation needed". */
+struct pmtu_state {
+    __u64 window_start_ns;
+    __u32 window_count;
+    __u32 frag_needed;
+    __u32 icmp_sent;
+    __u32 padding;
 };
 
 /* Datagram identity for a fragment; values come from the original IPv4 header. */

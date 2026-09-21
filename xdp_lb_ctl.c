@@ -15,8 +15,6 @@
 #define DEVICE_IP_MAP_PATH MAP_DIR "/device_ip_map"
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 
-/* -------------------------- Static configuration -------------------- */
-
 struct backend_config {
     const char *ip;
 };
@@ -58,8 +56,6 @@ static const struct service_config services[] = {
         .backend_count = ARRAY_SIZE(server_group2),
     },
 };
-
-/* ---------------------------- Input parsing -------------------------- */
 
 static int parse_number(const char *text, __u32 minimum, __u32 maximum,
                         __u32 *value, const char *name)
@@ -161,8 +157,6 @@ static int parse_backend_key(char **arguments, struct backend_key *key)
     return 0;
 }
 
-/* ------------------------------- Map I/O ----------------------------- */
-
 static int open_map(const char *path)
 {
     int fd = bpf_obj_get(path);
@@ -193,8 +187,6 @@ static int change_map(const char *path, const void *key, const void *value)
     }
     return 0;
 }
-
-/* ------------------------------ Commands ----------------------------- */
 
 static int add_vip(char **arguments)
 {
@@ -257,7 +249,14 @@ static int set_device_ip(char **arguments)
     return change_map(DEVICE_IP_MAP_PATH, &key, &device);
 }
 
-static int set_fragment_handling(char **arguments)
+enum device_toggle {
+    TOGGLE_FRAGMENT_HANDLING,
+    TOGGLE_ICMP_PMTU,
+};
+
+/* Read-modify-write so one toggle never clears the other settings. */
+static int set_device_toggle(const char *text, enum device_toggle toggle,
+                             const char *name)
 {
     struct device_config device = {};
     __u32 key = 0;
@@ -265,7 +264,7 @@ static int set_fragment_handling(char **arguments)
     int fd;
     int result;
 
-    if (parse_toggle(arguments[0], &enabled, "fragment handling"))
+    if (parse_toggle(text, &enabled, name))
         return -1;
 
     fd = open_map(DEVICE_IP_MAP_PATH);
@@ -278,7 +277,11 @@ static int set_fragment_handling(char **arguments)
         return -1;
     }
 
-    device.fragment_handling_enabled = enabled;
+    if (toggle == TOGGLE_FRAGMENT_HANDLING)
+        device.fragment_handling_enabled = enabled;
+    else
+        device.icmp_pmtu_enabled = enabled;
+
     result = bpf_map_update_elem(fd, &key, &device, BPF_ANY);
     close(fd);
 
@@ -289,9 +292,20 @@ static int set_fragment_handling(char **arguments)
     return 0;
 }
 
+static int set_fragment_handling(char **arguments)
+{
+    return set_device_toggle(arguments[0], TOGGLE_FRAGMENT_HANDLING,
+                             "fragment handling");
+}
+
+static int set_pmtu_icmp(char **arguments)
+{
+    return set_device_toggle(arguments[0], TOGGLE_ICMP_PMTU, "PMTU ICMP");
+}
+
 static int apply_config(char **arguments)
 {
-    /* Zero-init leaves fragment_handling_enabled off; enable it explicitly. */
+    /* Zero-init leaves both feature toggles off; enable them explicitly. */
     struct device_config device = {};
     __u32 device_key = 0;
 
@@ -347,8 +361,6 @@ static int apply_config(char **arguments)
     return 0;
 }
 
-/* -------------------------- Command dispatch ------------------------- */
-
 struct command {
     const char *name;
     const char *parameters;
@@ -364,6 +376,7 @@ static const struct command commands[] = {
     { "del-backend", "<vip_ip> <port> <tcp|udp> <slot>", 4, delete_backend },
     { "set-device-ip", "<device_ip>", 1, set_device_ip },
     { "set-fragment-handling", "<on|off>", 1, set_fragment_handling },
+    { "set-pmtu-icmp", "<on|off>", 1, set_pmtu_icmp },
 };
 
 static void usage(const char *program)

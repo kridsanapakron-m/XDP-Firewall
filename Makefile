@@ -13,8 +13,9 @@ LDLIBS_CTL := -lbpf
 
 BPF_OBJECTS := xdp_lb.o xdp_lb_deencap.o
 CTL_BINARY := xdp_lb_ctl
+CONF_BINARY := xdp_lb_conf
 
-all: $(BPF_OBJECTS) $(CTL_BINARY)
+all: $(BPF_OBJECTS) $(CTL_BINARY) $(CONF_BINARY)
 
 xdp_lb.o: xdp_lb.c xdp_lb_common.h
 	$(CLANG) $(CFLAGS_BPF) -c xdp_lb.c -o $@
@@ -25,7 +26,10 @@ xdp_lb_deencap.o: xdp_lb_deencap.c
 $(CTL_BINARY): xdp_lb_ctl.c xdp_lb_common.h
 	$(CC) $(CFLAGS_CTL) xdp_lb_ctl.c -o $@ $(LDLIBS_CTL)
 
+$(CONF_BINARY): xdp_lb_conf.c xdp_lb_common.h
+	$(CC) $(CFLAGS_CTL) xdp_lb_conf.c -o $@ $(LDLIBS_CTL)
+
 clean:
-	rm -f $(BPF_OBJECTS) $(CTL_BINARY)
+	rm -f $(BPF_OBJECTS) $(CTL_BINARY) $(CONF_BINARY)
 
 .PHONY: all clean
