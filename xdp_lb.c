@@ -9,13 +9,12 @@
 #include "xdp_lb_common.h"
 
 /*
- * XDP DSR load balance
+ * XDP DSR load balancer
  *
  * Load-balancer flow:
- *   parse -> detect fragments -> find VIP -> hash
-                -> if later frag first -> store backend in frag cache
-                    else first frag -> make it to sample backend -> store backend in frag cache
- *         -> find backend
+ *   parse -> whole packet:   find VIP -> hash -> find backend
+ *         -> first fragment: same, then remember the backend in frag cache
+ *         -> later fragment: backend remembered for its first fragment
  *         -> encapsulate with IPv4-in-IPv4 -> redirect
  *
  * Helpers that can end the packet's journey return an XDP action directly, so
@@ -27,16 +26,7 @@
 #define IPV4_DF 0x4000
 #define IPV4_MF 0x2000
 #define IPV4_FRAG_OFFSET_MASK 0x1fff
-#define DEVICE_IP_KEY 0
 
-#define PARSE_RESULT_UNSUPPORTED -1
-#define PARSE_RESULT_OK 0
-#define PARSE_RESULT_FRAGMENT_FIRST 1
-#define PARSE_RESULT_FRAGMENT_LATER 2
-
-#define ACTION_CONTINUE -1
-
-#define PMTU_STATE_KEY 0
 #define PMTU_REPLIES_PER_SECOND 25
 #define ONE_SECOND_NS 1000000000ULL
 #define IPV4_MINIMUM_MTU 68
@@ -44,6 +34,13 @@
 #define ICMP_QUOTED_BYTES (sizeof(struct iphdr) + 8)
 #define ICMP_REPLY_SIZE (sizeof(struct ethhdr) + sizeof(struct iphdr) + \
                          sizeof(struct icmphdr) + ICMP_QUOTED_BYTES)
+
+enum packet_kind {
+    PACKET_UNSUPPORTED,
+    PACKET_WHOLE,
+    PACKET_FIRST_FRAGMENT,
+    PACKET_LATER_FRAGMENT,
+};
 
 struct flow_key {
     __be32 source_address;
@@ -60,14 +57,14 @@ struct layer4_ports {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
+    __uint(max_entries, MAX_VIPS);
     __type(key, struct vip_key);
     __type(value, struct vip_value);
 } vip_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, MAX_BACKEND_SLOTS);
     __type(key, struct backend_key);
     __type(value, struct backend);
 } backend_map SEC(".maps");
@@ -93,7 +90,7 @@ struct {
     __type(value, struct pmtu_state);
 } pmtu_state_map SEC(".maps");
 
-static __always_inline int
+static __always_inline enum packet_kind
 parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
                     struct iphdr **out_ipv4)
 {
@@ -107,11 +104,11 @@ parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
     __u16 frag_off;
 
     if ((void *)(ethernet + 1) > data_end || ethernet->h_proto != bpf_htons(ETH_P_IP))
-        return PARSE_RESULT_UNSUPPORTED;
+        return PACKET_UNSUPPORTED;
 
     ipv4 = (void *)(ethernet + 1);
     if ((void *)(ipv4 + 1) > data_end)
-        return PARSE_RESULT_UNSUPPORTED;
+        return PACKET_UNSUPPORTED;
 
     ipv4_length = ipv4->ihl * 4;
     total_length = bpf_ntohs(ipv4->tot_len);
@@ -119,20 +116,20 @@ parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
         ipv4_length < sizeof(*ipv4) ||
         total_length < ipv4_length ||
         total_length > (__u32)(data_end - (void *)ipv4))
-        return PARSE_RESULT_UNSUPPORTED;
+        return PACKET_UNSUPPORTED;
 
     *out_ipv4 = ipv4;
 
     frag_off = bpf_ntohs(ipv4->frag_off);
     if (frag_off & IPV4_FRAG_OFFSET_MASK)
-        return PARSE_RESULT_FRAGMENT_LATER;
+        return PACKET_LATER_FRAGMENT;
 
     if (ipv4->protocol != IPPROTO_TCP && ipv4->protocol != IPPROTO_UDP)
-        return PARSE_RESULT_UNSUPPORTED;
+        return PACKET_UNSUPPORTED;
 
     ports = (void *)ipv4 + ipv4_length;
     if (ipv4_length + sizeof(*ports) > total_length || (void *)(ports + 1) > data_end)
-        return PARSE_RESULT_UNSUPPORTED;
+        return PACKET_UNSUPPORTED;
 
     flow->source_address = ipv4->saddr;
     flow->destination_address = ipv4->daddr;
@@ -140,7 +137,7 @@ parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
     flow->destination_port = ports->destination;
     flow->protocol = ipv4->protocol;
 
-    return (frag_off & IPV4_MF) ? PARSE_RESULT_FRAGMENT_FIRST : PARSE_RESULT_OK;
+    return (frag_off & IPV4_MF) ? PACKET_FIRST_FRAGMENT : PACKET_WHOLE;
 }
 
 static __always_inline __u32 mix_hash(__u32 hash, __u32 value)
@@ -161,18 +158,18 @@ static __always_inline __u32 flow_hash(const struct flow_key *flow)
 
 static __always_inline __be32 find_backend(const struct flow_key *flow)
 {
-    struct vip_key vip_key = {
-        .address = flow->destination_address,
-        .port = flow->destination_port,
-        .protocol = flow->protocol,
-        .padding = 0,
+    struct backend_key key = {
+        .vip = {
+            .address = flow->destination_address,
+            .port = flow->destination_port,
+            .protocol = flow->protocol,
+        },
     };
-    struct backend_key backend_key = {};
     struct vip_value *vip;
     struct backend *backend;
     __u32 backend_count;
 
-    vip = bpf_map_lookup_elem(&vip_map, &vip_key);
+    vip = bpf_map_lookup_elem(&vip_map, &key.vip);
     if (!vip)
         return 0;
 
@@ -180,50 +177,47 @@ static __always_inline __be32 find_backend(const struct flow_key *flow)
     if (backend_count == 0 || backend_count > MAX_BACKENDS_PER_VIP)
         return 0;
 
-    backend_key.vip = vip_key;
-    backend_key.slot = flow_hash(flow) % backend_count;
-
-    backend = bpf_map_lookup_elem(&backend_map, &backend_key);
+    key.slot = flow_hash(flow) % backend_count;
+    backend = bpf_map_lookup_elem(&backend_map, &key);
     return backend ? backend->address : 0;
 }
 
-static __always_inline int
-handle_fragment(const struct iphdr *ipv4, const struct flow_key *flow,
-                __be32 *backend_address)
+static __always_inline struct frag_key frag_key_of(const struct iphdr *ipv4)
 {
-    struct frag_key key = {};
-    struct frag_entry candidate = {};
-    struct frag_entry *existing;
-    __u64 now = bpf_ktime_get_ns();
+    return (struct frag_key){
+        .source_address = ipv4->saddr,
+        .destination_address = ipv4->daddr,
+        .identification = ipv4->id,
+        .protocol = ipv4->protocol,
+    };
+}
 
-    key.source_address = ipv4->saddr;
-    key.destination_address = ipv4->daddr;
-    key.identification = ipv4->id;
-    key.protocol = ipv4->protocol;
+/*
+ * Always overwrites: an unexpired entry under the same key is either a
+ * duplicate of this first fragment or an earlier datagram that reused its
+ * 16-bit IP ID, and in both cases this fragment's backend is the right one.
+ */
+static __always_inline int frag_remember(const struct iphdr *ipv4,
+                                         __be32 backend_address)
+{
+    struct frag_key key = frag_key_of(ipv4);
+    struct frag_entry entry = {
+        .backend_address = backend_address,
+        .expires_at_ns = bpf_ktime_get_ns() + FRAG_TIMEOUT_NS,
+    };
 
-    existing = bpf_map_lookup_elem(&frag_cache_map, &key);
-    if (existing && existing->expires_at_ns > now) {
-        if (flow &&
-            (existing->source_port != flow->source_port ||
-             existing->destination_port != flow->destination_port))
-            return XDP_DROP;
+    return bpf_map_update_elem(&frag_cache_map, &key, &entry, BPF_ANY);
+}
 
-        *backend_address = existing->backend_address;
-        return ACTION_CONTINUE;
-    }
+/* Returns 0 when the first fragment was never seen or its entry expired. */
+static __always_inline __be32 frag_backend(const struct iphdr *ipv4)
+{
+    struct frag_key key = frag_key_of(ipv4);
+    struct frag_entry *entry = bpf_map_lookup_elem(&frag_cache_map, &key);
 
-    if (!flow)
-        return XDP_PASS;
-
-    candidate.backend_address = *backend_address;
-    candidate.source_port = flow->source_port;
-    candidate.destination_port = flow->destination_port;
-    candidate.expires_at_ns = now + FRAG_TIMEOUT_NS;
-
-    if (bpf_map_update_elem(&frag_cache_map, &key, &candidate, BPF_ANY))
-        return XDP_PASS;
-
-    return ACTION_CONTINUE;
+    if (!entry || entry->expires_at_ns <= bpf_ktime_get_ns())
+        return 0;
+    return entry->backend_address;
 }
 
 static __always_inline __sum16 checksum16(const void *start, __u32 length)
@@ -243,17 +237,16 @@ static __always_inline void
 build_ipv4_header(struct iphdr *ipv4, __u16 total_length, __u8 protocol,
                   __be32 source, __be32 destination)
 {
-    ipv4->version = 4;
-    ipv4->ihl = sizeof(*ipv4) / 4;
-    ipv4->tos = 0;
-    ipv4->tot_len = bpf_htons(total_length);
-    ipv4->id = 0;
-    ipv4->frag_off = bpf_htons(IPV4_DF);
-    ipv4->ttl = DEFAULT_TTL;
-    ipv4->protocol = protocol;
-    ipv4->saddr = source;
-    ipv4->daddr = destination;
-    ipv4->check = 0;
+    *ipv4 = (struct iphdr){
+        .version = 4,
+        .ihl = sizeof(*ipv4) / 4,
+        .tot_len = bpf_htons(total_length),
+        .frag_off = bpf_htons(IPV4_DF),
+        .ttl = DEFAULT_TTL,
+        .protocol = protocol,
+        .saddr = source,
+        .daddr = destination,
+    };
     ipv4->check = checksum16(ipv4, sizeof(*ipv4));
 }
 
@@ -318,8 +311,7 @@ static __always_inline int
 handle_fragmentation_needed(struct xdp_md *ctx, const struct device_config *device,
                             const struct iphdr *inner_ipv4, __u16 route_mtu)
 {
-    __u32 state_key = PMTU_STATE_KEY;
-    struct pmtu_state *state = bpf_map_lookup_elem(&pmtu_state_map, &state_key);
+    struct pmtu_state *state = bpf_map_lookup_elem(&pmtu_state_map, &(__u32){0});
     int action;
 
     if (!state)
@@ -341,26 +333,23 @@ static __always_inline int
 encapsulate_and_redirect(struct xdp_md *ctx, const struct device_config *device,
                          const struct iphdr *inner_ipv4, __be32 backend_address)
 {
-    struct bpf_fib_lookup route = {};
+    __u32 outer_ip_size = sizeof(struct iphdr) + bpf_ntohs(inner_ipv4->tot_len);
+    struct bpf_fib_lookup route = {
+        .family = IPV4_FAMILY,
+        .l4_protocol = IPPROTO_IPIP,
+        .tot_len = outer_ip_size,
+        .ifindex = ctx->ingress_ifindex,
+        .ipv4_src = device->ip_address,
+        .ipv4_dst = backend_address,
+    };
     void *data;
     void *data_end;
     struct ethhdr *outer_ethernet;
     struct iphdr *outer_ipv4;
-    __u32 inner_size;
-    __u32 outer_ip_size;
     int fib_result;
 
-    inner_size = bpf_ntohs(inner_ipv4->tot_len);
-    if (inner_size > 0xffff - sizeof(struct iphdr))
+    if (outer_ip_size > 0xffff)
         return XDP_PASS;
-    outer_ip_size = sizeof(struct iphdr) + inner_size;
-
-    route.family = IPV4_FAMILY;
-    route.ifindex = ctx->ingress_ifindex;
-    route.l4_protocol = IPPROTO_IPIP;
-    route.tot_len = outer_ip_size;
-    route.ipv4_src = device->ip_address;
-    route.ipv4_dst = backend_address;
 
     fib_result = bpf_fib_lookup(ctx, &route, sizeof(route), 0);
     if (fib_result == BPF_FIB_LKUP_RET_FRAG_NEEDED)
@@ -396,36 +385,30 @@ int xdp_lb_main(struct xdp_md *ctx)
     struct flow_key flow = {};
     struct device_config *device;
     struct iphdr *ipv4 = NULL;
-    __be32 backend_address = 0;
-    __u32 device_ip_key = DEVICE_IP_KEY;
-    int parse_result;
-    int action;
+    __be32 backend_address;
+    enum packet_kind kind;
 
-    device = bpf_map_lookup_elem(&device_ip_map, &device_ip_key);
+    device = bpf_map_lookup_elem(&device_ip_map, &(__u32){0});
     if (!device || !device->ip_address)
         return XDP_PASS;
 
-    parse_result = parse_client_packet(ctx, &flow, &ipv4);
-    if (parse_result == PARSE_RESULT_UNSUPPORTED)
+    kind = parse_client_packet(ctx, &flow, &ipv4);
+    if (kind == PACKET_UNSUPPORTED)
         return XDP_PASS;
 
-    if (parse_result != PARSE_RESULT_OK && !device->fragment_handling_enabled)
+    if (kind != PACKET_WHOLE && !device->fragment_handling_enabled)
         return XDP_PASS;
 
-    if (parse_result == PARSE_RESULT_FRAGMENT_LATER) {
-        action = handle_fragment(ipv4, NULL, &backend_address);
-    } else {
+    if (kind == PACKET_LATER_FRAGMENT)
+        backend_address = frag_backend(ipv4);
+    else
         backend_address = find_backend(&flow);
-        if (!backend_address)
-            return XDP_PASS;
+    if (!backend_address)
+        return XDP_PASS;
 
-        action = ACTION_CONTINUE;
-        if (parse_result == PARSE_RESULT_FRAGMENT_FIRST)
-            action = handle_fragment(ipv4, &flow, &backend_address);
-    }
-
-    if (action != ACTION_CONTINUE)
-        return action;
+    if (kind == PACKET_FIRST_FRAGMENT &&
+        frag_remember(ipv4, backend_address))
+        return XDP_PASS;
 
     return encapsulate_and_redirect(ctx, device, ipv4, backend_address);
 }

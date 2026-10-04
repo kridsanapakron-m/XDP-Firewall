@@ -3,7 +3,9 @@
 
 #include <linux/types.h>
 
+#define MAX_VIPS 1024
 #define MAX_BACKENDS_PER_VIP 64
+#define MAX_BACKEND_SLOTS (MAX_VIPS * MAX_BACKENDS_PER_VIP)
 
 /* Fragment cache: fixed size, LRU-evicted automatically when full. */
 #define FRAG_CACHE_MAX_ENTRIES 65536
@@ -57,8 +59,7 @@ struct frag_key {
 /* Cached result of backend selection made for the first fragment. */
 struct frag_entry {
     __be32 backend_address;
-    __be16 source_port;
-    __be16 destination_port;
+    __u32 padding;
     __u64 expires_at_ns;
 };
 
