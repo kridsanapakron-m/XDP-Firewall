@@ -5,3 +5,4 @@ xdp_lb_ctl
 *test*
 *.json
 xdp_lb_conf
+.*

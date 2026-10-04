@@ -41,7 +41,6 @@
 #define ONE_SECOND_NS 1000000000ULL
 #define IPV4_MINIMUM_MTU 68
 
-/* ICMP errors quote the original IPv4 header plus its first 8 payload bytes. */
 #define ICMP_QUOTED_BYTES (sizeof(struct iphdr) + 8)
 #define ICMP_REPLY_SIZE (sizeof(struct ethhdr) + sizeof(struct iphdr) + \
                          sizeof(struct icmphdr) + ICMP_QUOTED_BYTES)
@@ -188,11 +187,6 @@ static __always_inline __be32 find_backend(const struct flow_key *flow)
     return backend ? backend->address : 0;
 }
 
-/*
- * Keeps every fragment of one datagram on a single backend. A later fragment
- * has no L4 header and therefore no flow, so it passes NULL and can only read
- * what the first fragment published.
- */
 static __always_inline int
 handle_fragment(const struct iphdr *ipv4, const struct flow_key *flow,
                 __be32 *backend_address)
@@ -263,66 +257,44 @@ build_ipv4_header(struct iphdr *ipv4, __u16 total_length, __u8 protocol,
     ipv4->check = checksum16(ipv4, sizeof(*ipv4));
 }
 
+/*
+ * Rewrites the oversized packet in place: its IPv4 header + 8 bytes are copied
+ * to where the reply quotes them, the headers in front are rebuilt, and the
+ * tail is trimmed off.
+ */
 static __always_inline int build_pmtu_reply(struct xdp_md *ctx, __u16 route_mtu)
 {
-    const int quote_shift = sizeof(struct iphdr) + sizeof(struct icmphdr);
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    struct iphdr *original = data + sizeof(struct ethhdr);
-    struct ethhdr *ethernet;
-    struct ethhdr *displaced_ethernet;
-    struct iphdr *ipv4;
-    struct iphdr *quoted;
-    struct icmphdr *icmp;
-    __u32 excess;
+    struct ethhdr *ethernet = data;
+    struct iphdr *ipv4 = (void *)(ethernet + 1);
+    struct icmphdr *icmp = (void *)(ipv4 + 1);
+    struct iphdr *quoted = (void *)(icmp + 1);
+    __u8 client_mac[ETH_ALEN];
 
-    if ((void *)original + ICMP_QUOTED_BYTES > data_end ||
-        original->ihl != sizeof(*original) / 4 ||
-        route_mtu < IPV4_MINIMUM_MTU + sizeof(*original))
+    if (data + ICMP_REPLY_SIZE > data_end ||
+        ipv4->ihl != sizeof(*ipv4) / 4 ||
+        route_mtu < IPV4_MINIMUM_MTU + sizeof(*ipv4))
         return XDP_PASS;
 
-    /*
-     * Growing the head by one IPv4 plus one ICMP header slides the original
-     * header into the exact offset the ICMP error has to quote it from, so the
-     * quoted bytes are already in place and never need copying.
-     */
-    if (bpf_xdp_adjust_head(ctx, -quote_shift))
-        return XDP_PASS;
+    __builtin_memcpy(quoted, ipv4, ICMP_QUOTED_BYTES);
 
-    data = (void *)(long)ctx->data;
-    data_end = (void *)(long)ctx->data_end;
-    ethernet = data;
-    ipv4 = (void *)(ethernet + 1);
-    icmp = (void *)(ipv4 + 1);
-    quoted = (void *)(icmp + 1);
-    displaced_ethernet = data + quote_shift;
-
-    if (data + ICMP_REPLY_SIZE > data_end)
-        return XDP_DROP;
-
-    /*
-     * Both headers written below land on top of the displaced Ethernet header,
-     * so its MACs must be read out first. The old destination is ours and
-     * becomes the reply source.
-     */
-    __builtin_memcpy(ethernet->h_dest, displaced_ethernet->h_source, ETH_ALEN);
-    __builtin_memcpy(ethernet->h_source, displaced_ethernet->h_dest, ETH_ALEN);
-    ethernet->h_proto = bpf_htons(ETH_P_IP);
+    __builtin_memcpy(client_mac, ethernet->h_source, ETH_ALEN);
+    __builtin_memcpy(ethernet->h_source, ethernet->h_dest, ETH_ALEN);
+    __builtin_memcpy(ethernet->h_dest, client_mac, ETH_ALEN);
 
     build_ipv4_header(ipv4, ICMP_REPLY_SIZE - sizeof(*ethernet), IPPROTO_ICMP,
                       quoted->daddr, quoted->saddr);
 
-    icmp->type = ICMP_DEST_UNREACH;
-    icmp->code = ICMP_FRAG_NEEDED;
-    icmp->checksum = 0;
-    icmp->un.frag.__unused = 0;
-    icmp->un.frag.mtu = bpf_htons((__u16)(route_mtu - sizeof(*ipv4)));
+    *icmp = (struct icmphdr){
+        .type = ICMP_DEST_UNREACH,
+        .code = ICMP_FRAG_NEEDED,
+        .un.frag.mtu = bpf_htons((__u16)(route_mtu - sizeof(*ipv4))),
+    };
     icmp->checksum = checksum16(icmp, sizeof(*icmp) + ICMP_QUOTED_BYTES);
 
-    excess = (__u32)(data_end - data) - (__u32)ICMP_REPLY_SIZE;
-    if (excess && bpf_xdp_adjust_tail(ctx, -(int)excess))
+    if (bpf_xdp_adjust_tail(ctx, ICMP_REPLY_SIZE - (int)(data_end - data)))
         return XDP_DROP;
-
     return XDP_TX;
 }
 
@@ -354,20 +326,14 @@ handle_fragmentation_needed(struct xdp_md *ctx, const struct device_config *devi
         return XDP_PASS;
 
     state->frag_needed++;
-
-    if (!device->icmp_pmtu_enabled)
-        return XDP_PASS;
-
-    if (!(inner_ipv4->frag_off & bpf_htons(IPV4_DF)))
-        return XDP_PASS;
-
-    if (!pmtu_reply_allowed(state))
+    if (!device->icmp_pmtu_enabled ||
+        !(inner_ipv4->frag_off & bpf_htons(IPV4_DF)) ||
+        !pmtu_reply_allowed(state))
         return XDP_PASS;
 
     action = build_pmtu_reply(ctx, route_mtu);
     if (action == XDP_TX)
         state->icmp_sent++;
-
     return action;
 }
 

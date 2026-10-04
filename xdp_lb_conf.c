@@ -40,11 +40,15 @@ struct service {
  * CONFIGURATION -- this is the only part meant to be edited.
  * ------------------------------------------------------------------------ */
 
-/* Where lb_setup.sh pinned the maps (bpftool ... pinmaps <dir>). */
+/*
+ * Where the maps were pinned (bpftool prog load ... pinmaps <dir>).
+ * xdp_lb_ctl has this same path compiled in as a #define, so changing it
+ * here means xdp_lb_ctl can no longer find the maps.
+ */
 static const char *map_dir = "/sys/fs/bpf/xdp_lb_test/maps";
 
 /* Tunnel source IP: this machine's address on the backend-facing interface. */
-static const char *device_ip = "192.168.116.145";
+static const char *device_ip = "192.168.100.20";
 
 /* Feature toggles: 1 = on, 0 = off. */
 static const int fragment_handling = 0;
@@ -64,19 +68,25 @@ static const int flush_first = 1;
  */
 static const struct service services[] = {
     {
-        .vip = "10.10.10.100",
+        .vip = "192.168.50.100",
         .port = 8080,
         .protocol = "tcp",
-        BACKENDS("10.200.1.2",
-                 "10.200.2.2",
-                 "10.200.3.2"),
+        BACKENDS("192.168.201.2",
+                 "192.168.202.2",
+                 "192.168.203.2"),
     },
+    /*
+     * vip_map is keyed by protocol, so UDP needs its own entry even on the
+     * same address and port. The fragmentation tests send UDP datagrams,
+     * which would otherwise miss the lookup and be passed through untouched.
+     */
     {
-        .vip = "10.10.10.101",
-        .port = 443,
-        .protocol = "tcp",
-        BACKENDS("10.200.1.2",
-                 "10.200.2.2"),
+        .vip = "192.168.50.100",
+        .port = 8080,
+        .protocol = "udp",
+        BACKENDS("192.168.201.2",
+                 "192.168.202.2",
+                 "192.168.203.2"),
     },
 };
 
