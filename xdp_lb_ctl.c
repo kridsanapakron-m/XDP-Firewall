@@ -1,450 +1,228 @@
 #include <arpa/inet.h>
 #include <errno.h>
-#include <linux/in.h>
+#include <jansson.h>
+#include <limits.h>
 #include <bpf/bpf.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "xdp_lb_common.h"
 
-#define MAP_DIR "/sys/fs/bpf/xdp_lb_test/maps"
-#define VIP_MAP_PATH MAP_DIR "/vip_map"
-#define BACKEND_MAP_PATH MAP_DIR "/backend_map"
-#define DEVICE_IP_MAP_PATH MAP_DIR "/device_ip_map"
+#define CONFIG_DIR "/etc/xdp_lb"
+#define CONFIG_PATH CONFIG_DIR "/xdp_lb.json"
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define fail(...) (fprintf(stderr, __VA_ARGS__), fputc('\n', stderr), -1)
 
-struct backend_config {
-    const char *ip;
+static const char *map_dir = "/sys/fs/bpf/xdp_lb_test/maps";
+static const char *device_ip = "192.168.100.20";
+
+static const char usage[] =
+    "usage: xdp_lb_ctl add-vip <vip> <port> <tcp|udp> <backend_ip>...\n"
+    "       xdp_lb_ctl del-vip <vip> <port> <tcp|udp>\n"
+    "       xdp_lb_ctl fragment <on|off>\n"
+    "       xdp_lb_ctl pmtu <on|off>\n"
+    "       xdp_lb_ctl apply\n";
+
+struct service {
+    struct vip_key vip;
+    struct vip_value value;
+    struct backend backends[MAX_BACKENDS_PER_VIP];
 };
 
-struct service_config {
-    const char *vip;
-    __u16 port;
-    const char *protocol;
-    const struct backend_config *backends;
-    size_t backend_count;
-};
+static struct device_config device;
+static struct service services[MAX_VIPS];
+static size_t service_count;
 
-static const char *device_ip = "192.168.10.1";
-
-static const struct backend_config server_group1[] = {
-    { "192.168.10.11" },
-    { "192.168.10.12" },
-};
-
-static const struct backend_config server_group2[] = {
-    { "192.168.20.11" },
-    { "192.168.20.12" },
-    { "192.168.20.13" },
-};
-
-static const struct service_config services[] = {
-    {
-        .vip = "10.0.0.100",
-        .port = 80,
-        .protocol = "tcp",
-        .backends = server_group1,
-        .backend_count = ARRAY_SIZE(server_group1),
-    },
-    {
-        .vip = "10.0.0.101",
-        .port = 443,
-        .protocol = "tcp",
-        .backends = server_group2,
-        .backend_count = ARRAY_SIZE(server_group2),
-    },
-};
-
-static int parse_number(const char *text, __u32 minimum, __u32 maximum,
-                        __u32 *value, const char *name)
+static int find_service(const struct vip_key *vip)
 {
-    char *invalid;
-    unsigned long number;
-
-    errno = 0;
-    number = strtoul(text, &invalid, 10);
-    if (errno || invalid == text || *invalid ||
-        number < minimum || number > maximum) {
-        fprintf(stderr, "invalid %s: %s\n", name, text);
-        return -1;
-    }
-
-    *value = (__u32)number;
-    return 0;
-}
-
-static int parse_port(const char *text, __be16 *port)
-{
-    __u32 number;
-
-    if (parse_number(text, 1, 65535, &number, "VIP port"))
-        return -1;
-
-    *port = htons((__u16)number);
-    return 0;
-}
-
-static int parse_protocol(const char *text, __u8 *protocol)
-{
-    if (!strcmp(text, "tcp")) {
-        *protocol = IPPROTO_TCP;
-        return 0;
-    }
-    if (!strcmp(text, "udp")) {
-        *protocol = IPPROTO_UDP;
-        return 0;
-    }
-    fprintf(stderr, "invalid protocol: %s\n", text);
+    for (size_t index = 0; index < service_count; index++)
+        if (!memcmp(&services[index].vip, vip, sizeof(*vip)))
+            return index;
     return -1;
 }
 
-static int parse_ipv4(const char *text, __be32 *address, const char *name)
+static int parse_service(json_t *item, struct service *service)
 {
-    if (inet_pton(AF_INET, text, address) == 1)
-        return 0;
+    const char *vip, *protocol;
+    json_t *backends, *backend;
+    json_error_t error;
+    size_t slot;
+    int port;
 
-    fprintf(stderr, "invalid %s address: %s\n", name, text);
-    return -1;
-}
-
-static int parse_toggle(const char *text, __u32 *value, const char *name)
-{
-    if (!strcmp(text, "on")) {
-        *value = 1;
-        return 0;
-    }
-    if (!strcmp(text, "off")) {
-        *value = 0;
-        return 0;
-    }
-    fprintf(stderr, "invalid %s: %s (expected on/off)\n", name, text);
-    return -1;
-}
-
-static int parse_vip(char **arguments, struct vip_key *vip)
-{
-    memset(vip, 0, sizeof(*vip));
-
-    if (parse_ipv4(arguments[0], &vip->address, "VIP") ||
-        parse_port(arguments[1], &vip->port) ||
-        parse_protocol(arguments[2], &vip->protocol))
-        return -1;
-
+    if (json_unpack_ex(item, &error, JSON_STRICT, "{s:s, s:i, s:s, s:o}", "vip", &vip,
+                       "port", &port, "protocol", &protocol, "backends", &backends))
+        return fail("%s", error.text);
+    *service = (struct service){
+        .vip.port = htons(port),
+        .vip.protocol = strcmp(protocol, "udp") ? IPPROTO_TCP : IPPROTO_UDP,
+        .value.backend_count = json_array_size(backends),
+    };
+    if (inet_pton(AF_INET, vip, &service->vip.address) != 1 || port < 1 || port > 65535 ||
+        (strcmp(protocol, "tcp") && strcmp(protocol, "udp")))
+        return fail("invalid VIP: %s %d %s", vip, port, protocol);
+    if (!json_is_array(backends) || json_array_size(backends) > MAX_BACKENDS_PER_VIP)
+        return fail("backends must be a list of at most %d addresses", MAX_BACKENDS_PER_VIP);
+    json_array_foreach(backends, slot, backend)
+        if (!json_is_string(backend) ||
+            inet_pton(AF_INET, json_string_value(backend), &service->backends[slot].address) != 1)
+            return fail("invalid backend address in %s", vip);
     return 0;
 }
 
-static void build_backend_key(struct backend_key *backend_key,
-                              const struct vip_key *vip, __u32 slot)
+static int parse_config(json_t *root)
 {
-    memset(backend_key, 0, sizeof(*backend_key));
-    backend_key->vip = *vip;
-    backend_key->slot = slot;
-}
+    json_t *list, *item;
+    json_error_t error;
+    int fragment, pmtu;
+    size_t index;
 
-static int parse_backend_key(char **arguments, struct backend_key *key)
-{
-    struct vip_key vip;
-    __u32 slot;
-
-    if (parse_vip(arguments, &vip) ||
-        parse_number(arguments[3], 0, MAX_BACKENDS_PER_VIP - 1,
-                     &slot, "backend slot"))
-        return -1;
-
-    build_backend_key(key, &vip, slot);
-    return 0;
-}
-
-static int open_map(const char *path)
-{
-    int fd = bpf_obj_get(path);
-
-    if (fd < 0)
-        fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
-    return fd;
-}
-
-static int change_map(const char *path, const void *key, const void *value)
-{
-    int fd = open_map(path);
-    int result;
-
-    if (fd < 0)
-        return -1;
-
-    result = value ? bpf_map_update_elem(fd, key, value, BPF_ANY)
-                   : bpf_map_delete_elem(fd, key);
-    close(fd);
-
-    if (!value && result == -ENOENT)
-        return 0;
-    if (result) {
-        fprintf(stderr, "cannot %s %s: %s\n",
-                value ? "update" : "delete from", path, strerror(-result));
-        return -1;
+    if (json_unpack_ex(root, &error, JSON_STRICT, "{s:b, s:b, s:o}", "fragment_handling",
+                       &fragment, "icmp_pmtu", &pmtu, "services", &list))
+        return fail("%s: %s", CONFIG_PATH, error.text);
+    if (!json_is_array(list) || json_array_size(list) > MAX_VIPS)
+        return fail("%s: services must be a list of at most %d entries", CONFIG_PATH, MAX_VIPS);
+    device = (struct device_config){
+        .fragment_handling_enabled = fragment,
+        .icmp_pmtu_enabled = pmtu,
+    };
+    inet_pton(AF_INET, device_ip, &device.ip_address);
+    json_array_foreach(list, index, item) {
+        if (parse_service(item, &services[index]))
+            return fail("  in %s services[%zu]", CONFIG_PATH, index);
     }
+    service_count = json_array_size(list);
     return 0;
 }
 
-static int add_vip(char **arguments)
+static int load_config(json_t **root)
 {
-    struct vip_value value = {};
-    struct vip_key vip;
+    json_error_t error;
 
-    if (parse_vip(arguments, &vip))
-        return -1;
-    if (parse_number(arguments[3], 1, MAX_BACKENDS_PER_VIP,
-                     &value.backend_count, "backend count"))
-        return -1;
-
-    /*
-     * BPF_ANY makes add-vip an upsert, so it also changes backend_count.
-     * Scale up:   create the new backend slot, then increase the count.
-     * Scale down: decrease the count, then delete the unused backend slot.
-     */
-    return change_map(VIP_MAP_PATH, &vip, &value);
+    if (access(CONFIG_PATH, F_OK))
+        *root = json_pack("{s:b, s:b, s:[]}", "fragment_handling", 0, "icmp_pmtu", 0, "services");
+    else if (!(*root = json_load_file(CONFIG_PATH, 0, &error)))
+        return fail("%s:%d:%d: %s", CONFIG_PATH, error.line, error.column, error.text);
+    return parse_config(*root);
 }
 
-static int delete_vip(char **arguments)
+static int save_config(json_t *root)
 {
-    struct vip_key vip;
-
-    if (parse_vip(arguments, &vip))
-        return -1;
-    return change_map(VIP_MAP_PATH, &vip, NULL);
+    mkdir(CONFIG_DIR, 0755);
+    if (json_dump_file(root, CONFIG_PATH ".tmp", JSON_INDENT(2)) ||
+        rename(CONFIG_PATH ".tmp", CONFIG_PATH))
+        return fail("cannot save %s: %s", CONFIG_PATH, strerror(errno));
+    return 0;
 }
 
-static int set_backend(char **arguments)
+static int open_map(const char *name)
 {
-    struct backend backend = {};
-    struct backend_key backend_key;
-
-    if (parse_backend_key(arguments, &backend_key) ||
-        parse_ipv4(arguments[4], &backend.address, "backend"))
-        return -1;
-
-    /* A backend may be prepared before its VIP is activated. */
-    return change_map(BACKEND_MAP_PATH, &backend_key, &backend);
-}
-
-static int delete_backend(char **arguments)
-{
-    struct backend_key backend_key;
-
-    if (parse_backend_key(arguments, &backend_key))
-        return -1;
-    return change_map(BACKEND_MAP_PATH, &backend_key, NULL);
-}
-
-/* Also resets fragment_handling_enabled to off; re-enable it afterward. */
-static int set_device_ip(char **arguments)
-{
-    struct device_config device = {};
-    __u32 key = 0;
-
-    if (parse_ipv4(arguments[0], &device.ip_address, "device IP"))
-        return -1;
-    return change_map(DEVICE_IP_MAP_PATH, &key, &device);
-}
-
-enum device_toggle {
-    TOGGLE_FRAGMENT_HANDLING,
-    TOGGLE_ICMP_PMTU,
-};
-
-/* Read-modify-write so one toggle never clears the other settings. */
-static int set_device_toggle(const char *text, enum device_toggle toggle,
-                             const char *name)
-{
-    struct device_config device = {};
-    __u32 key = 0;
-    __u32 enabled;
+    char path[256];
     int fd;
-    int result;
 
-    if (parse_toggle(text, &enabled, name))
+    snprintf(path, sizeof(path), "%s/%s", map_dir, name);
+    fd = bpf_obj_get(path);
+    return fd < 0 ? fail("cannot open %s: %s", path, strerror(errno)) : fd;
+}
+
+/* VIPs are removed before the slots they count and written after them. */
+static int sync_maps(void)
+{
+    int vip_fd = open_map("vip_map"), backend_fd = open_map("backend_map");
+    int device_fd = open_map("device_ip_map");
+    struct backend_key key; /* big enough for the keys of both maps */
+
+    if (vip_fd < 0 || backend_fd < 0 || device_fd < 0)
         return -1;
+    while (!bpf_map_get_next_key(vip_fd, NULL, &key))
+        if (bpf_map_delete_elem(vip_fd, &key))
+            goto error;
+    while (!bpf_map_get_next_key(backend_fd, NULL, &key))
+        if (bpf_map_delete_elem(backend_fd, &key))
+            goto error;
+    if (bpf_map_update_elem(device_fd, &(__u32){0}, &device, BPF_ANY))
+        goto error;
+    for (struct service *service = services; service < services + service_count; service++) {
+        struct backend_key slot = { .vip = service->vip };
 
-    fd = open_map(DEVICE_IP_MAP_PATH);
-    if (fd < 0)
-        return -1;
-
-    if (bpf_map_lookup_elem(fd, &key, &device)) {
-        fprintf(stderr, "device IP is not configured yet; run set-device-ip first\n");
-        close(fd);
-        return -1;
-    }
-
-    if (toggle == TOGGLE_FRAGMENT_HANDLING)
-        device.fragment_handling_enabled = enabled;
-    else
-        device.icmp_pmtu_enabled = enabled;
-
-    result = bpf_map_update_elem(fd, &key, &device, BPF_ANY);
-    close(fd);
-
-    if (result) {
-        fprintf(stderr, "cannot update %s: %s\n", DEVICE_IP_MAP_PATH, strerror(-result));
-        return -1;
+        for (; slot.slot < service->value.backend_count; slot.slot++)
+            if (bpf_map_update_elem(backend_fd, &slot, &service->backends[slot.slot], BPF_ANY))
+                goto error;
+        if (bpf_map_update_elem(vip_fd, &service->vip, &service->value, BPF_ANY))
+            goto error;
     }
     return 0;
+error:
+    return fail("cannot write maps: %s", strerror(errno));
 }
 
-static int set_fragment_handling(char **arguments)
+/* add-vip passes backends and adds or replaces the service; del-vip passes none. */
+static int edit_vip(json_t *root, char **args)
 {
-    return set_device_toggle(arguments[0], TOGGLE_FRAGMENT_HANDLING,
-                             "fragment handling");
-}
+    json_t *list = json_object_get(root, "services");
+    json_t *port = json_loads(args[1], JSON_DECODE_ANY, NULL);
+    json_t *backends = json_array();
+    struct service parsed;
+    json_t *item;
+    int index;
 
-static int set_pmtu_icmp(char **arguments)
-{
-    return set_device_toggle(arguments[0], TOGGLE_ICMP_PMTU, "PMTU ICMP");
-}
-
-static int apply_config(char **arguments)
-{
-    /* Zero-init leaves both feature toggles off; enable them explicitly. */
-    struct device_config device = {};
-    __u32 device_key = 0;
-
-    (void)arguments;
-
-    if (parse_ipv4(device_ip, &device.ip_address, "device IP") ||
-        change_map(DEVICE_IP_MAP_PATH, &device_key, &device))
+    if (!port)
+        return fail("invalid port: %s", args[1]);
+    for (char **backend = args + 3; *backend; backend++)
+        json_array_append_new(backends, json_string(*backend));
+    item = json_pack("{s:s, s:o, s:s, s:o}", "vip", args[0], "port", port,
+                     "protocol", args[2], "backends", backends);
+    if (parse_service(item, &parsed))
         return -1;
 
-    for (size_t service_index = 0;
-         service_index < ARRAY_SIZE(services); service_index++) {
-        const struct service_config *service = &services[service_index];
-        struct vip_value vip_value = {};
-        struct vip_key vip;
-
-        memset(&vip, 0, sizeof(vip));
-        if (parse_ipv4(service->vip, &vip.address, "VIP") ||
-            parse_protocol(service->protocol, &vip.protocol))
-            return -1;
-        if (!service->port) {
-            fprintf(stderr, "invalid VIP port: %u\n", service->port);
-            return -1;
-        }
-        if (!service->backend_count ||
-            service->backend_count > MAX_BACKENDS_PER_VIP) {
-            fprintf(stderr, "invalid backend count: %zu\n",
-                    service->backend_count);
-            return -1;
-        }
-
-        vip.port = htons(service->port);
-        vip_value.backend_count = (__u32)service->backend_count;
-
-        for (size_t slot = 0; slot < service->backend_count; slot++) {
-            const struct backend_config *configured_backend =
-                &service->backends[slot];
-            struct backend backend = {};
-            struct backend_key backend_key;
-
-            if (parse_ipv4(configured_backend->ip, &backend.address,
-                           "backend"))
-                return -1;
-
-            build_backend_key(&backend_key, &vip, (__u32)slot);
-            if (change_map(BACKEND_MAP_PATH, &backend_key, &backend))
-                return -1;
-        }
-
-        if (change_map(VIP_MAP_PATH, &vip, &vip_value))
-            return -1;
-    }
-
-    return 0;
+    index = find_service(&parsed.vip);
+    if (args[3])
+        return index < 0 ? json_array_append_new(list, item)
+                         : json_array_set_new(list, index, item);
+    if (index < 0)
+        return fail("no such VIP: %s %s %s", args[0], args[1], args[2]);
+    return json_array_remove(list, index);
 }
 
-struct command {
+static int set_toggle(json_t *root, const char *key, const char *value)
+{
+    if (strcmp(value, "on") && strcmp(value, "off"))
+        return fail("invalid value: %s (expected on/off)", value);
+    return json_object_set_new(root, key, json_boolean(!strcmp(value, "on")));
+}
+
+static const struct command {
     const char *name;
-    const char *parameters;
-    size_t argument_count;
-    int (*run)(char **arguments);
+    int min_args, max_args;
+    const char *toggle;
+} commands[] = {
+    { "add-vip", 4, INT_MAX, NULL },
+    { "del-vip", 3, 3, NULL },
+    { "fragment", 1, 1, "fragment_handling" },
+    { "pmtu", 1, 1, "icmp_pmtu" },
+    { "apply", 0, 0, NULL },
 };
-
-static const struct command commands[] = {
-    { "apply-config", "", 0, apply_config },
-    { "add-vip", "<vip_ip> <port> <tcp|udp> <backend_count>", 4, add_vip },
-    { "del-vip", "<vip_ip> <port> <tcp|udp>", 3, delete_vip },
-    { "set-backend", "<vip_ip> <port> <tcp|udp> <slot> <backend_ip>", 5, set_backend },
-    { "del-backend", "<vip_ip> <port> <tcp|udp> <slot>", 4, delete_backend },
-    { "set-device-ip", "<device_ip>", 1, set_device_ip },
-    { "set-fragment-handling", "<on|off>", 1, set_fragment_handling },
-    { "set-pmtu-icmp", "<on|off>", 1, set_pmtu_icmp },
-};
-
-static void usage(const char *program)
-{
-    fprintf(stderr, "Usage:\n");
-    for (size_t i = 0; i < ARRAY_SIZE(commands); i++)
-        fprintf(stderr, "  %s %s%s%s\n", program, commands[i].name,
-                commands[i].parameters[0] ? " " : "", commands[i].parameters);
-}
-
-static const struct command *find_command(const char *name)
-{
-    for (size_t i = 0; i < ARRAY_SIZE(commands); i++) {
-        if (!strcmp(name, commands[i].name))
-            return &commands[i];
-    }
-    return NULL;
-}
 
 int main(int argc, char **argv)
 {
-    const struct command *command;
+    const struct command *command = commands, *end = commands + ARRAY_SIZE(commands);
+    int edits = argc > 1 && strcmp(argv[1], "apply");
+    json_t *root;
 
-    if (argc < 2) {
-        usage(argv[0]);
+    while (command < end && strcmp(command->name, argc > 1 ? argv[1] : ""))
+        command++;
+    if (command == end || argc - 2 < command->min_args || argc - 2 > command->max_args) {
+        fputs(usage, stderr);
         return 1;
     }
 
-    command = find_command(argv[1]);
-    if (!command || (size_t)(argc - 2) != command->argument_count) {
-        usage(argv[0]);
+    if (load_config(&root))
         return 1;
-    }
-    return command->run(argv + 2) ? 1 : 0;
+    if (edits && (command->toggle ? set_toggle(root, command->toggle, argv[2])
+                                  : edit_vip(root, argv + 2)))
+        return 1;
+    if (parse_config(root) || sync_maps() || (edits && save_config(root)))
+        return 1;
+    return 0;
 }
-
-/*
- * Apply the static configuration:
- *   sudo ./xdp_lb_ctl apply-config
- *
- * Example configuration
- * ---------------------
- *   VIP:              10.0.0.100:80/TCP
- *   Load balancer IP: 192.168.10.1
- *   Backend 0:        192.168.10.11
- *   Backend 1:        192.168.10.12
- *
- * Configure the tunnel source IP:
- *   sudo ./xdp_lb_ctl set-device-ip 192.168.10.1
- *
- * Prepare every backend slot before activating the VIP:
- *   sudo ./xdp_lb_ctl set-backend 10.0.0.100 80 tcp 0 192.168.10.11
- *   sudo ./xdp_lb_ctl set-backend 10.0.0.100 80 tcp 1 192.168.10.12
- *   sudo ./xdp_lb_ctl add-vip 10.0.0.100 80 tcp 2
- *
- * add-vip is an upsert. Scale up by preparing the new slot first:
- *   sudo ./xdp_lb_ctl set-backend 10.0.0.100 80 tcp 2 192.168.10.13
- *   sudo ./xdp_lb_ctl add-vip 10.0.0.100 80 tcp 3
- *
- * Scale down by decreasing backend_count before deleting the slot:
- *   sudo ./xdp_lb_ctl add-vip 10.0.0.100 80 tcp 2
- *   sudo ./xdp_lb_ctl del-backend 10.0.0.100 80 tcp 2
- *
- * Delete a service: remove the VIP first, then its backend slots.
- *   sudo ./xdp_lb_ctl del-vip 10.0.0.100 80 tcp
- *   sudo ./xdp_lb_ctl del-backend 10.0.0.100 80 tcp 0
- *   sudo ./xdp_lb_ctl del-backend 10.0.0.100 80 tcp 1
- *
- * Changing backend_count can move existing flows to different backends
- * because the current selection is: flow_hash modulo backend_count.
- */

@@ -7,12 +7,13 @@
 #include <bpf/bpf_helpers.h>
 
 #include "xdp_lb_common.h"
+#include "xdp_lb_awfd_common.h"
 
 /*
  * XDP DSR load balancer
  *
  * Load-balancer flow:
- *   parse -> whole packet:   find VIP -> hash -> find backend
+ *   parse -> whole packet:   find VIP -> connection table -> AWFD (awfd())
  *         -> first fragment: same, then remember the backend in frag cache
  *         -> later fragment: backend remembered for its first fragment
  *         -> encapsulate with IPv4-in-IPv4 -> redirect
@@ -90,6 +91,22 @@ struct {
     __type(value, struct pmtu_state);
 } pmtu_state_map SEC(".maps");
 
+/* AWFD tables (Figure 5); replaced whole per VIP, so readers never see half an update. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_VIPS);
+    __type(key, struct vip_key);
+    __type(value, struct awfd_classes);
+} awfd_map SEC(".maps");
+
+/* Connection table (Section IV-A, Figure 6). DSR never sees a close, so LRU evicts. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, AWFD_CONN_MAX_ENTRIES);
+    __type(key, struct flow_key);
+    __type(value, struct backend);
+} conn_map SEC(".maps");
+
 static __always_inline enum packet_kind
 parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
                     struct iphdr **out_ipv4)
@@ -140,20 +157,35 @@ parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
     return (frag_off & IPV4_MF) ? PACKET_FIRST_FRAGMENT : PACKET_WHOLE;
 }
 
-static __always_inline __u32 mix_hash(__u32 hash, __u32 value)
+/* FNV-1a applied to 32-bit words of the 5-tuple instead of single bytes. */
+static __always_inline __u32 fnv1a_flow_hash(const struct flow_key *flow)
 {
-    return (hash ^ value) * 16777619u;
-}
-
-static __always_inline __u32 flow_hash(const struct flow_key *flow)
-{
-    __u32 ports = ((__u32)flow->source_port << 16) | flow->destination_port;
+    __u32 words[] = {
+        flow->source_address,
+        flow->destination_address,
+        ((__u32)flow->source_port << 16) | flow->destination_port,
+        flow->protocol,
+    };
     __u32 hash = 2166136261u;
 
-    hash = mix_hash(hash, flow->source_address);
-    hash = mix_hash(hash, flow->destination_address);
-    hash = mix_hash(hash, ports);
-    return mix_hash(hash, flow->protocol);
+    for (int i = 0; i < 4; i++)
+        hash = (hash ^ words[i]) * 16777619u;
+    return hash;
+}
+
+/*
+ * murmur3 finalizer. The low bits of an FNV hash depend only on the low bits
+ * of its input, which are constant for the rig's addresses and ports, so every
+ * bit is mixed before any modulo.
+ */
+static __always_inline __u32 fmix32(__u32 hash)
+{
+    hash ^= hash >> 16;
+    hash *= 0x85ebca6bu;
+    hash ^= hash >> 13;
+    hash *= 0xc2b2ae35u;
+    hash ^= hash >> 16;
+    return hash;
 }
 
 static __always_inline __be32 find_backend(const struct flow_key *flow)
@@ -177,9 +209,88 @@ static __always_inline __be32 find_backend(const struct flow_key *flow)
     if (backend_count == 0 || backend_count > MAX_BACKENDS_PER_VIP)
         return 0;
 
-    key.slot = flow_hash(flow) % backend_count;
+    key.slot = fnv1a_flow_hash(flow) % backend_count;
     backend = bpf_map_lookup_elem(&backend_map, &key);
     return backend ? backend->address : 0;
+}
+
+/*
+ * AWFD flow dispatching (Aghdai et al., "Spotlight", reseach/1806.08455v3.pdf).
+ * Returns the backend for a VIP packet that carries ports, or 0 when the packet
+ * is not for a VIP. find_backend() above is the plain ECMP baseline.
+ */
+static __always_inline __be32 awfd(const struct flow_key *flow)
+{
+    struct backend_key key = {
+        .vip = {
+            .address = flow->destination_address,
+            .port = flow->destination_port,
+            .protocol = flow->protocol,
+        },
+    };
+    struct awfd_classes *classes;
+    struct vip_value *vip;
+    struct backend *backend;
+    __u32 backend_count, stage1, stage2, point, class, size, index;
+
+    /* 1. Traffic that is not for a VIP never touches the connection table. */
+    vip = bpf_map_lookup_elem(&vip_map, &key.vip);
+    if (!vip)
+        return 0;
+    backend_count = vip->backend_count;
+    if (backend_count == 0 || backend_count > MAX_BACKENDS_PER_VIP)
+        return 0;
+
+    /* 2. A known connection keeps its backend (PCC, Section IV-A). */
+    backend = bpf_map_lookup_elem(&conn_map, flow);
+    if (backend)
+        return backend->address;
+
+    /*
+     * 3. A new connection starts from ECMP over all backends, which is what
+     * AWFD is when the VIP has no classes (m = 0, Section III-B1). Stage II
+     * gets its own hash so the stages are independent as eq. 2 assumes.
+     */
+    stage1 = fmix32(fnv1a_flow_hash(flow));
+    stage2 = fmix32(stage1);
+    key.slot = stage1 % backend_count;
+
+    classes = bpf_map_lookup_elem(&awfd_map, &key.vip);
+    if (classes && classes->weight_sum) {
+        /*
+         * 4. Stage I picks B_k with probability k * |B_k| / sum(w) (eq. 1).
+         * This is Algorithm 1 with < instead of <=, which gives the shares of
+         * eq. 2; the last class takes the rest, like its final else.
+         */
+        point = stage1 % classes->weight_sum;
+        for (class = 0; class < AWFD_MAX_WEIGHT - 1; class++)
+            if (point < classes->range_end[class])
+                break;
+
+        /* Stage II picks a member of B_k with equal probability (ECMP). */
+        size = classes->class_size[class];
+        if (size) {
+            index = stage2 % size;
+            barrier_var(index); /* keeps the bound check below, which the verifier needs */
+
+            /* 5. A member slot the VIP no longer has leaves the ECMP choice. */
+            if (index < MAX_BACKENDS_PER_VIP && classes->members[class][index] < backend_count)
+                key.slot = classes->members[class][index];
+        }
+    }
+
+    backend = bpf_map_lookup_elem(&backend_map, &key);
+    if (!backend)
+        return 0;
+
+    /* 6. When another CPU inserted the same new flow first, its choice wins. */
+    if (bpf_map_update_elem(&conn_map, flow, backend, BPF_NOEXIST)) {
+        struct backend *first = bpf_map_lookup_elem(&conn_map, flow);
+
+        if (first)
+            return first->address;
+    }
+    return backend->address;
 }
 
 static __always_inline struct frag_key frag_key_of(const struct iphdr *ipv4)
@@ -402,7 +513,7 @@ int xdp_lb_main(struct xdp_md *ctx)
     if (kind == PACKET_LATER_FRAGMENT)
         backend_address = frag_backend(ipv4);
     else
-        backend_address = find_backend(&flow);
+        backend_address = awfd(&flow);
     if (!backend_address)
         return XDP_PASS;
 

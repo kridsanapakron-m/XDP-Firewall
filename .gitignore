@@ -6,3 +6,10 @@ xdp_lb_ctl
 *.json
 xdp_lb_conf
 .*
+!load_aware/*.sh
+load_aware/xdp_lb_lab_conf
+load_aware/xdp_lb_lab_daemon
+reseach
+load_aware
+xdp_lb_awfd
+xdp_lb_agent
