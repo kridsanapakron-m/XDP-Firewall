@@ -105,6 +105,19 @@
     font-family:"IBM Plex Mono",ui-monospace,monospace;
     width:100%;
   }
+  select{
+    background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+    border-radius:var(--radius);padding:8px 10px;font-size:13px;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;width:100%;cursor:pointer;
+  }
+  select:focus-visible{outline:2px solid var(--focus);outline-offset:1px;}
+  .action-hint{font-size:11.5px;color:#5B647A;margin-top:-2px;}
+  .action-tag{
+    font-family:"IBM Plex Mono",monospace;font-size:10.5px;text-transform:uppercase;
+    border-radius:3px;padding:0 5px;margin-left:4px;border:1px solid currentColor;
+  }
+  .action-tag.redirect{color:var(--warn);}
+  .action-tag.drop{color:#F0958A;}
   input:focus-visible, button:focus-visible, .switch input:focus-visible + .track{
     outline:2px solid var(--focus);outline-offset:1px;
   }
@@ -206,7 +219,7 @@
   <header class="top">
     <div>
       <h1><span class="pulse-dot"></span>XDP DDoS Protection</h1>
-      <p>แผงควบคุมสำหรับทดสอบ eBPF/XDP rate-limit &amp; redirect-to-honeypot</p>
+      <p>แผงควบคุมสำหรับทดสอบ eBPF/XDP rate-limit &amp; redirect-to-honeypot / drop</p>
     </div>
     <div class="foot-note" id="clockLine">—</div>
   </header>
@@ -245,7 +258,7 @@
   </div>
 
   <div class="panel">
-    <h2>Protocol thresholds <span class="sub">ต่อโปรโตคอล — index 0 (other) คือค่า fallback</span></h2>
+    <h2>Protocol thresholds <span class="sub">ต่อโปรโตคอล — index 0 (other) คือค่า fallback · action = สิ่งที่ทำกับ IP ที่เกิน threshold</span></h2>
     <div class="proto-grid" id="protoGrid"></div>
   </div>
 
@@ -401,6 +414,16 @@ function protoCardHtml(name, c){
         <label>block_duration <span class="unit">s</span></label>
         <input type="number" min="0" step="0.1" data-field="block_duration_s" value="${c.block_duration_s}">
       </div>
+      <div class="field">
+        <label>action <span class="unit">เมื่อเกิน threshold</span></label>
+        <select data-field="action">
+          <option value="redirect" ${c.action === "drop" ? "" : "selected"}>redirect → honeypot</option>
+          <option value="drop" ${c.action === "drop" ? "selected" : ""}>drop</option>
+        </select>
+        <div class="action-hint">${c.action === "drop"
+          ? "ทิ้ง packet จนกว่าจะหมด block_duration"
+          : "ส่งไป honeypot ผ่าน tx_port (ปลดแบนผ่านหน้า honeypot ได้)"}</div>
+      </div>
       <div class="save-row">
         <button class="small primary" data-save="${name}">บันทึก</button>
       </div>
@@ -417,7 +440,13 @@ function renderProtoCards(){
       input.addEventListener("change", () => {
         const field = input.dataset.field;
         config.protocols[name][field] =
-          field === "enabled" ? input.checked : parseFloat(input.value);
+          field === "enabled" ? input.checked :
+          field === "action"  ? input.value   : parseFloat(input.value);
+        if (field === "action"){
+          card.querySelector(".action-hint").textContent = input.value === "drop"
+            ? "ทิ้ง packet จนกว่าจะหมด block_duration"
+            : "ส่งไป honeypot ผ่าน tx_port (ปลดแบนผ่านหน้า honeypot ได้)";
+        }
         card.classList.toggle("disabled", !config.protocols[name].enabled);
       });
     });
@@ -449,7 +478,7 @@ async function loadStats(){
         <td class="mono">${r.packet_count}</td>
         <td>
           ${r.blocked
-            ? `<span class="status-pill blocked">บล็อกอยู่ · เหลือ ${fmtSeconds(r.blocked_remaining_s)}</span>`
+            ? `<span class="status-pill blocked">บล็อกอยู่ · เหลือ ${fmtSeconds(r.blocked_remaining_s)}<span class="action-tag ${r.action}">${r.action}</span></span>`
             : `<span class="status-pill ok">ปกติ</span>`}
         </td>
         <td class="foot-note">${fmtSeconds(r.last_seen_s_ago)} ที่แล้ว</td>

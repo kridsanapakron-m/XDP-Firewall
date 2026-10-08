@@ -5,12 +5,16 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-/* ค่า limit ต่อ protocol  (24 bytes) */
+#define ACTION_REDIRECT 0   /* ส่งไป honeypot (ค่า default เพราะ map เริ่มต้นเป็น 0) */
+#define ACTION_DROP     1   /* ทิ้ง packet ทันที */
+
 struct proto_config {
     __u64 block_ns;
     __u64 window_ns;
     __u32 threshold;
-    __u32 enabled;      
+    __u32 enabled;
+    __u32 action;       /* ACTION_REDIRECT / ACTION_DROP */
+    __u32 pad;
 };
 
 /* ค่ากลาง  (12 bytes) */
@@ -84,10 +88,6 @@ int ddos_protection(struct xdp_md *ctx)
     }
     if (pc->threshold == 0)                        return XDP_PASS;
 
-    struct global_config *gc = bpf_map_lookup_elem(&global_config_map, &zero);
-    if (!gc)                                       return XDP_PASS;
-
-    
     struct flow_key key = {
         .ip    = __builtin_bswap32(iph->saddr),
         .proto = proto,
@@ -102,7 +102,7 @@ int ddos_protection(struct xdp_md *ctx)
     }
 
     if (e->blocked_until && now < e->blocked_until)
-        goto redirect;
+        goto limited;
 
     if (now - e->last_update > pc->window_ns) {   /* window ใหม่ */
         e->last_update   = now;
@@ -114,11 +114,17 @@ int ddos_protection(struct xdp_md *ctx)
     e->packet_count++;
     if (e->packet_count > pc->threshold) {
         e->blocked_until = now + pc->block_ns;
-        goto redirect;
+        goto limited;
     }
     return XDP_PASS;
 
-redirect:
+limited:
+    if (pc->action == ACTION_DROP)
+        return XDP_DROP;
+
+    /* ACTION_REDIRECT → ส่งไป honeypot */
+    struct global_config *gc = bpf_map_lookup_elem(&global_config_map, &zero);
+    if (!gc)                                       return XDP_DROP;
     __builtin_memcpy(eth->h_dest,   gc->honeypot_mac, ETH_ALEN);
     __builtin_memcpy(eth->h_source, gc->firewall_mac, ETH_ALEN);
     return bpf_redirect_map(&tx_port, 0, 0);

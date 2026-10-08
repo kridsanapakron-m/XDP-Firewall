@@ -13,10 +13,15 @@ IN_IF, OUT_IF = "ens33", "ens34"
 PORT = 5000
 UNBAN_ALLOWED_SOURCES = []           # เช่น ["192.168.184.201"]
 
-PROTO_FMT  = "<QQII"                 # block_ns, window_ns, threshold, enabled  (24 B)
+PROTO_FMT  = "<QQIIII"               # block_ns, window_ns, threshold, enabled, action, pad (32 B)
+PROTO_SIZE = struct.calcsize(PROTO_FMT)
 GLOBAL_FMT = "<6s6s"                 # honeypot_mac, firewall_mac                (12 B)
 KEY_FMT    = "<II"                   # ip, proto                                  (8 B)
 ENTRY_FMT  = "<QQI"                  # last_update, blocked_until, packet_count
+
+# action เมื่อเกิน threshold  (ต้องตรงกับ ACTION_* ใน xdp_ratelimit.c)
+ACTIONS     = {"redirect": 0, "drop": 1}
+ACTION_NAME = {v: k for k, v in ACTIONS.items()}
 
 # protocol ที่แสดงบนหน้าเว็บ  
 PROTOCOLS = {"tcp": 6, "udp": 17, "icmp": 1, "other": 0}
@@ -58,15 +63,23 @@ def add_log(ip, source, result):
 
 def read_proto(proto):
     j = json.loads(bt("map", "lookup", "pinned", PROTO_MAP, "key", "hex", *u32key(proto)))
-    block_ns, win_ns, thr, en = struct.unpack(PROTO_FMT, jbytes(j["value"])[:24])
+    raw = jbytes(j["value"])
+    if len(raw) < PROTO_SIZE:
+        raise RuntimeError("proto_config_map ยังเป็นเวอร์ชันเก่า (ไม่มีฟิลด์ action) — รัน setup.sh ใหม่เพื่อโหลด xdp_ratelimit.o ตัวล่าสุด")
+    block_ns, win_ns, thr, en, act, _ = struct.unpack(PROTO_FMT, raw[:PROTO_SIZE])
     return {"enabled": bool(en), "threshold": thr,
-            "time_window_ms": win_ns / 1e6, "block_duration_s": block_ns / 1e9}
+            "time_window_ms": win_ns / 1e6, "block_duration_s": block_ns / 1e9,
+            "action": ACTION_NAME.get(act, "redirect")}
 
 def write_proto(proto, c):
+    action = c.get("action", "redirect")
+    if action not in ACTIONS:
+        raise ValueError(f"action ต้องเป็น {' หรือ '.join(ACTIONS)} (ได้ {action!r})")
     val = struct.pack(PROTO_FMT,
                       int(float(c["block_duration_s"]) * 1e9),
                       int(float(c["time_window_ms"]) * 1e6),
-                      int(c["threshold"]), 1 if c.get("enabled") else 0)
+                      int(c["threshold"]), 1 if c.get("enabled") else 0,
+                      ACTIONS[action], 0)
     bt("map", "update", "pinned", PROTO_MAP, "key", "hex", *u32key(proto), "value", "hex", *hx(val))
 
 def read_global():
@@ -88,14 +101,27 @@ def write_config(c):
         if name in c["protocols"]:
             write_proto(num, c["protocols"][name])
 
+def effective_action(proto, cache):
+    """action ที่ XDP จะใช้จริงกับ proto นี้ (ถ้า proto ไม่ได้เปิด จะ fallback ไปที่ index 0)"""
+    def cfg(p):
+        if p not in cache:
+            try: cache[p] = read_proto(p)
+            except Exception: cache[p] = None
+        return cache[p]
+    c = cfg(proto)
+    if not c or not c["enabled"]:
+        c = cfg(0)
+    return c["action"] if c else "redirect"
+
 def dump_rate():
-    now = ktime_ns(); rows = []
+    now = ktime_ns(); rows = []; cache = {}
     for e in json.loads(bt("map", "dump", "pinned", RATE_MAP)):
         ip_int, proto = struct.unpack(KEY_FMT, jbytes(e["key"]))
         last, blocked_until, cnt = struct.unpack(ENTRY_FMT, jbytes(e["value"])[:20])
         rows.append({"ip": str(ipaddress.IPv4Address(ip_int)),
                      "proto": proto, "proto_name": PROTO_NAME.get(proto, str(proto)),
                      "packet_count": cnt,
+                     "action": effective_action(proto, cache),
                      "blocked": bool(blocked_until and now < blocked_until),
                      "blocked_remaining_s": max(0, (blocked_until - now) / 1e9) if blocked_until else 0,
                      "last_seen_s_ago": max(0, (now - last) / 1e9)})
