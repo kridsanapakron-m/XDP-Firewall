@@ -6,7 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "xdp_lb_awfd_common.h"
+#include "xdp_lb_common.h"
 
 /*
  * Answers AWFD probes with the utilization U and capacity C of one backend,

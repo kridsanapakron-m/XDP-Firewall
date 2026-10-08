@@ -7,20 +7,6 @@
 #include <bpf/bpf_helpers.h>
 
 #include "xdp_lb_common.h"
-#include "xdp_lb_awfd_common.h"
-
-/*
- * XDP DSR load balancer
- *
- * Load-balancer flow:
- *   parse -> whole packet:   find VIP -> connection table -> AWFD (awfd())
- *         -> first fragment: same, then remember the backend in frag cache
- *         -> later fragment: backend remembered for its first fragment
- *         -> encapsulate with IPv4-in-IPv4 -> redirect
- *
- * Helpers that can end the packet's journey return an XDP action directly, so
- * XDP_PASS/XDP_DROP/XDP_TX/XDP_REDIRECT is the only result vocabulary they use.
- */
 
 #define IPV4_FAMILY 2
 #define DEFAULT_TTL 64
@@ -91,7 +77,6 @@ struct {
     __type(value, struct pmtu_state);
 } pmtu_state_map SEC(".maps");
 
-/* AWFD tables (Figure 5); replaced whole per VIP, so readers never see half an update. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_VIPS);
@@ -99,7 +84,6 @@ struct {
     __type(value, struct awfd_classes);
 } awfd_map SEC(".maps");
 
-/* Connection table (Section IV-A, Figure 6). DSR never sees a close, so LRU evicts. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, AWFD_CONN_MAX_ENTRIES);
@@ -157,7 +141,6 @@ parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
     return (frag_off & IPV4_MF) ? PACKET_FIRST_FRAGMENT : PACKET_WHOLE;
 }
 
-/* FNV-1a applied to 32-bit words of the 5-tuple instead of single bytes. */
 static __always_inline __u32 fnv1a_flow_hash(const struct flow_key *flow)
 {
     __u32 words[] = {
@@ -173,11 +156,6 @@ static __always_inline __u32 fnv1a_flow_hash(const struct flow_key *flow)
     return hash;
 }
 
-/*
- * murmur3 finalizer. The low bits of an FNV hash depend only on the low bits
- * of its input, which are constant for the rig's addresses and ports, so every
- * bit is mixed before any modulo.
- */
 static __always_inline __u32 fmix32(__u32 hash)
 {
     hash ^= hash >> 16;
@@ -214,11 +192,6 @@ static __always_inline __be32 find_backend(const struct flow_key *flow)
     return backend ? backend->address : 0;
 }
 
-/*
- * AWFD flow dispatching (Aghdai et al., "Spotlight", reseach/1806.08455v3.pdf).
- * Returns the backend for a VIP packet that carries ports, or 0 when the packet
- * is not for a VIP. find_backend() above is the plain ECMP baseline.
- */
 static __always_inline __be32 awfd(const struct flow_key *flow)
 {
     struct backend_key key = {
@@ -233,7 +206,6 @@ static __always_inline __be32 awfd(const struct flow_key *flow)
     struct backend *backend;
     __u32 backend_count, stage1, stage2, point, class, size, index;
 
-    /* 1. Traffic that is not for a VIP never touches the connection table. */
     vip = bpf_map_lookup_elem(&vip_map, &key.vip);
     if (!vip)
         return 0;
@@ -241,39 +213,26 @@ static __always_inline __be32 awfd(const struct flow_key *flow)
     if (backend_count == 0 || backend_count > MAX_BACKENDS_PER_VIP)
         return 0;
 
-    /* 2. A known connection keeps its backend (PCC, Section IV-A). */
     backend = bpf_map_lookup_elem(&conn_map, flow);
     if (backend)
         return backend->address;
 
-    /*
-     * 3. A new connection starts from ECMP over all backends, which is what
-     * AWFD is when the VIP has no classes (m = 0, Section III-B1). Stage II
-     * gets its own hash so the stages are independent as eq. 2 assumes.
-     */
     stage1 = fmix32(fnv1a_flow_hash(flow));
     stage2 = fmix32(stage1);
     key.slot = stage1 % backend_count;
 
     classes = bpf_map_lookup_elem(&awfd_map, &key.vip);
     if (classes && classes->weight_sum) {
-        /*
-         * 4. Stage I picks B_k with probability k * |B_k| / sum(w) (eq. 1).
-         * This is Algorithm 1 with < instead of <=, which gives the shares of
-         * eq. 2; the last class takes the rest, like its final else.
-         */
         point = stage1 % classes->weight_sum;
         for (class = 0; class < AWFD_MAX_WEIGHT - 1; class++)
             if (point < classes->range_end[class])
                 break;
 
-        /* Stage II picks a member of B_k with equal probability (ECMP). */
         size = classes->class_size[class];
         if (size) {
             index = stage2 % size;
-            barrier_var(index); /* keeps the bound check below, which the verifier needs */
+            barrier_var(index);
 
-            /* 5. A member slot the VIP no longer has leaves the ECMP choice. */
             if (index < MAX_BACKENDS_PER_VIP && classes->members[class][index] < backend_count)
                 key.slot = classes->members[class][index];
         }
@@ -283,7 +242,6 @@ static __always_inline __be32 awfd(const struct flow_key *flow)
     if (!backend)
         return 0;
 
-    /* 6. When another CPU inserted the same new flow first, its choice wins. */
     if (bpf_map_update_elem(&conn_map, flow, backend, BPF_NOEXIST)) {
         struct backend *first = bpf_map_lookup_elem(&conn_map, flow);
 
@@ -303,11 +261,6 @@ static __always_inline struct frag_key frag_key_of(const struct iphdr *ipv4)
     };
 }
 
-/*
- * Always overwrites: an unexpired entry under the same key is either a
- * duplicate of this first fragment or an earlier datagram that reused its
- * 16-bit IP ID, and in both cases this fragment's backend is the right one.
- */
 static __always_inline int frag_remember(const struct iphdr *ipv4,
                                          __be32 backend_address)
 {
@@ -320,7 +273,6 @@ static __always_inline int frag_remember(const struct iphdr *ipv4,
     return bpf_map_update_elem(&frag_cache_map, &key, &entry, BPF_ANY);
 }
 
-/* Returns 0 when the first fragment was never seen or its entry expired. */
 static __always_inline __be32 frag_backend(const struct iphdr *ipv4)
 {
     struct frag_key key = frag_key_of(ipv4);
@@ -361,11 +313,6 @@ build_ipv4_header(struct iphdr *ipv4, __u16 total_length, __u8 protocol,
     ipv4->check = checksum16(ipv4, sizeof(*ipv4));
 }
 
-/*
- * Rewrites the oversized packet in place: its IPv4 header + 8 bytes are copied
- * to where the reply quotes them, the headers in front are rebuilt, and the
- * tail is trimmed off.
- */
 static __always_inline int build_pmtu_reply(struct xdp_md *ctx, __u16 route_mtu)
 {
     void *data = (void *)(long)ctx->data;

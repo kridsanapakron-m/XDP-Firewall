@@ -61,7 +61,6 @@ int xdp_lb_deencap(struct xdp_md *ctx)
     __builtin_memcpy(source_mac, outer_ethernet_header->h_source, ETH_ALEN);
     __builtin_memcpy(destination_mac, outer_ethernet_header->h_dest, ETH_ALEN);
 
-    /* Removing only outer IPv4 leaves room to rebuild Ethernet. */
     if (bpf_xdp_adjust_head(ctx, outer_header_length))
         return XDP_PASS;
 
