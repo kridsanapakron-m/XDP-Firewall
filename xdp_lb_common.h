@@ -38,13 +38,21 @@ struct device_config {
     __u32 icmp_pmtu_enabled;
 };
 
-/* Per-CPU rate-limit window and counters for ICMP "fragmentation needed". */
-struct pmtu_state {
-    __u64 window_start_ns;
-    __u32 window_count;
-    __u32 frag_needed;
-    __u32 icmp_sent;
-    __u32 padding;
+#define LB_XDP_ACTIONS 5 /* XDP_ABORTED .. XDP_REDIRECT */
+
+/* Per-CPU counters of xdp_lb, the single entry of stats_map; user space sums the CPUs. */
+struct lb_stats {
+    __u64 action[LB_XDP_ACTIONS]; /* indexed by the XDP action returned */
+    __u64 conn_hit;               /* packet of a flow already in conn_map */
+    __u64 conn_new;               /* new flow written to conn_map */
+    __u64 conn_race;              /* conn_map write failed, usually another CPU wrote first */
+    __u64 awfd_dispatched;        /* new flow placed by awfd_map classes instead of ECMP */
+    __u64 frag_hit;               /* later fragment found in frag_cache_map */
+    __u64 frag_miss;              /* later fragment without a live cache entry */
+    __u64 frag_store_failed;      /* first fragment that could not be cached */
+    __u64 fib_failed;             /* bpf_fib_lookup gave neither success nor frag-needed */
+    __u64 frag_needed;            /* packet too big once wrapped in IPIP */
+    __u64 icmp_sent;              /* "fragmentation needed" replies sent */
 };
 
 /* Datagram identity for a fragment; values come from the original IPv4 header. */

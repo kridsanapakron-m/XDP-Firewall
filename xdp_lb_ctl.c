@@ -3,6 +3,7 @@
 #include <jansson.h>
 #include <limits.h>
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -23,7 +24,18 @@ static const char usage[] =
     "       xdp_lb_ctl del-vip <vip> <port> <tcp|udp>\n"
     "       xdp_lb_ctl fragment <on|off>\n"
     "       xdp_lb_ctl pmtu <on|off>\n"
-    "       xdp_lb_ctl apply\n";
+    "       xdp_lb_ctl apply\n"
+    "       xdp_lb_ctl stats [reset]\n";
+
+/* Same order as the fields of struct lb_stats. */
+static const char *const stat_names[] = {
+    "xdp_aborted", "xdp_drop", "xdp_pass", "xdp_tx", "xdp_redirect",
+    "conn_hit", "conn_new", "conn_race", "awfd_dispatched",
+    "frag_hit", "frag_miss", "frag_store_failed", "fib_failed",
+    "frag_needed", "icmp_sent",
+};
+_Static_assert(ARRAY_SIZE(stat_names) == sizeof(struct lb_stats) / sizeof(__u64),
+               "stat_names must name every counter of struct lb_stats");
 
 struct service {
     struct vip_key vip;
@@ -157,6 +169,30 @@ error:
     return fail("cannot write maps: %s", strerror(errno));
 }
 
+/* Prints stats_map summed over CPUs, or zeroes it when given "reset". */
+static int show_stats(const char *reset)
+{
+    int cpus = libbpf_num_possible_cpus(), fd = open_map("stats_map");
+    struct lb_stats per_cpu[cpus > 0 ? cpus : 1];
+    __u64 totals[ARRAY_SIZE(stat_names)] = { 0 };
+
+    if (cpus <= 0 || fd < 0 || (reset && strcmp(reset, "reset")))
+        return fail("cannot read stats_map (usage: xdp_lb_ctl stats [reset])");
+    if (reset) {
+        memset(per_cpu, 0, sizeof(per_cpu));
+        return bpf_map_update_elem(fd, &(__u32){0}, per_cpu, BPF_ANY)
+                   ? fail("cannot reset stats_map: %s", strerror(errno)) : 0;
+    }
+    if (bpf_map_lookup_elem(fd, &(__u32){0}, per_cpu))
+        return fail("cannot read stats_map: %s", strerror(errno));
+    for (int cpu = 0; cpu < cpus; cpu++)
+        for (size_t index = 0; index < ARRAY_SIZE(totals); index++)
+            totals[index] += ((__u64 *)&per_cpu[cpu])[index];
+    for (size_t index = 0; index < ARRAY_SIZE(totals); index++)
+        printf("%-18s %llu\n", stat_names[index], (unsigned long long)totals[index]);
+    return 0;
+}
+
 /* add-vip passes backends and adds or replaces the service; del-vip passes none. */
 static int edit_vip(json_t *root, char **args)
 {
@@ -202,6 +238,7 @@ static const struct command {
     { "fragment", 1, 1, "fragment_handling" },
     { "pmtu", 1, 1, "icmp_pmtu" },
     { "apply", 0, 0, NULL },
+    { "stats", 0, 1, NULL },
 };
 
 int main(int argc, char **argv)
@@ -216,6 +253,8 @@ int main(int argc, char **argv)
         fputs(usage, stderr);
         return 1;
     }
+    if (!strcmp(command->name, "stats"))
+        return show_stats(argv[2]) != 0;
 
     if (load_config(&root))
         return 1;
