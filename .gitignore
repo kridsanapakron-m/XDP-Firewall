@@ -1,7 +1,6 @@
 *.o
-*.txt
 xdp_lb_ctl
-*.sh
+/test/*.sh
 *test*
 *.json
 xdp_lb_conf
@@ -13,3 +12,6 @@ reseach
 load_aware
 xdp_lb_awfd
 xdp_lb_agent
+lab*
+Perf_t/results
+Perf_t/export

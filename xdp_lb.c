@@ -458,14 +458,16 @@ SEC("xdp")
 int xdp_lb_main(struct xdp_md *ctx)
 {
     struct lb_stats *stats = bpf_map_lookup_elem(&stats_map, &(__u32){0});
-    int action;
+    __u32 action, index;
 
     if (!stats)
         return XDP_PASS;
 
     action = load_balance(ctx, stats);
-    if (action >= 0 && action < LB_XDP_ACTIONS)
-        stats->action[action]++;
+    index = action;
+    barrier_var(index);
+    if (index < LB_XDP_ACTIONS)
+        stats->action[index]++;
     return action;
 }
 
