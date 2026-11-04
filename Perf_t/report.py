@@ -25,7 +25,7 @@ BACKENDS = (1, 2, 3)
 LINK_GOODPUT = 940.0            # Mbit/s ที่ TCP ได้จริงบน 1G
 LINK_BOUND = 0.9                # C0 >= 90% ของ LINK_GOODPUT = ติด link แยกอัลกอริทึมไม่ได้
 CV_FLAG = 0.10
-CPU_KINDS = ("cores", "usr", "sys", "soft")    # b_<kind> จาก mpstat  หักรอบ idle แล้วเป็น lb_<kind>
+CPU_KINDS = ("cores", "usr", "sys", "soft", "perf")  # b_<kind> จาก mpstat (perf = cycle ของ CPU ข้อ 1.5)  หักรอบ idle แล้วเป็น lb_<kind>
 STABLE_BALANCE, STABLE_SECONDS = 1.1, 3
 T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262,
         10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}
@@ -37,12 +37,13 @@ NO_CV_FLAG = {"loss_lb", "loss_e2e", "error_rate", "conn_new_ratio", "frag_miss"
 FORMATS = {"ns_per_fwd_pkt": ".0f", "ns_per_rx_pkt": ".0f", "xdp_ns": ".0f", "sent_pps": ".0f", "req_s": ".0f",
            "thr": ".0f", "mbps": ".0f", "cpu_us_per_req": ".1f", "avg_pkt_bytes": ".0f", "loss_lb": ".3f",
            "loss_e2e": ".3f", "error_rate": ".3f", "conn_new_ratio": ".3f", "icmp_ratio": ".3f",
-           "frag_delivery_pct": ".1f", "frag_hit": ".0f", "frag_miss": ".0f", "frag_store_failed": ".0f",
+           "frag_delivery_pct": ".0f", "frag_hit": ".0f", "frag_miss": ".0f", "frag_store_failed": ".0f",
            "conn_new": ".0f", "awfd_dispatched": ".0f", "omega": ".3f", "c_rx_drops": ".0f",
-           "flood_dps": ".0f", "frag_dps": ".0f", "q_max_share": ".0f", "convergence_s": ".1f",
+           "frag_dps": ".0f", "q_max_share": ".0f", "convergence_s": ".1f",
            "b1_thr": ".0f", "b2_thr": ".0f", "b3_thr": ".0f", "d_p50_ms": ".3f", "d_p99_ms": ".3f",
            "lookup_ns": ".0f", "d_lookup_ns": ".0f", "x": ".0f", "y": ".0f", "z": ".0f", "y_pct": ".1f",
-           "z_pct": ".2f", "frag_share_pct": ".1f"}
+           "z_pct": ".2f", "perf_ns_per_fwd_pkt": ".0f", "cycles_per_fwd_pkt": ".0f",
+           "cpu0_pct": ".0f", "cpu_cores": ".2f", "cpu_hot_pct": ".0f", "cpu_ns_per_pkt": ".0f", "cpu_ns_per_datagram": ".0f"}
 
 
 def num(pairs, key):
@@ -78,8 +79,9 @@ def parse_traffic(text, m):
     """บรรทัด "traffic:" ที่ run_tests.sh พิมพ์หลัง pktgen / hping3 / tcpreplay"""
     for line in re.findall(r"^traffic: (.*)$", text, re.M):
         fields = dict(field.split("=", 1) for field in line.split() if "=" in field)
-        count, rate = {"frag": ("frag_datagrams", "frag_dps"),
-                       "flood": ("flood_datagrams", "flood_dps")}.get(fields.get("kind"), ("sent", "sent_pps"))
+        count, rate = {"frag": ("frag_datagrams", "frag_dps")}.get(fields.get("kind"), ("sent", "sent_pps"))
+        if fields.get("kind") == "frag":
+            m["frag_packets"] = m.get("frag_packets", 0) + float(fields.get("packets", 0))
         m[count] = m.get(count, 0) + float(fields.get("sent", 0))
         m[rate] = m.get(rate, 0) + float(fields.get("achieved_pps", 0))
         m[count + "_target_pps"] = m.get(count + "_target_pps", 0) + float(fields.get("target_pps", 0))
@@ -215,6 +217,11 @@ def measure(directory, run_id, meta, latency=True):
     for host in "abc":
         for kind, value in mpstat(directory / f"{run_id}.cpu-{host}.json.gz").items():
             m[f"{host}_cpu_seconds" if kind == "seconds" else f"{host}_{kind}"] = value
+    # 1.5: cycle ของ CPU (unhalted) ทุก core ของ B จาก node_exporter ก่อน/หลังยิง -> core เฉลี่ยในช่วงนั้น
+    perf = [read_pairs(directory / f"{run_id}.p{i}") for i in (0, 1)]
+    if (seconds := (num(perf[1], "time_ns") - num(perf[0], "time_ns")) / 1e9) > 0 and num(perf[1], "freq_hz") > 0:
+        m["b_freq_ghz"] = num(perf[1], "freq_hz") / 1e9
+        m["b_perf"] = (num(perf[1], "cycles") - num(perf[0], "cycles")) / seconds / num(perf[1], "freq_hz")
     m["c_rx_drops"] = d("c", "nic_rx_dropped") + d("c", "nic_rx_missed_errors")
     m["b_rx_drops"] = d("b", "nic_rx_dropped") + d("b", "nic_rx_missed_errors")
     for key in snap["b1"]:
@@ -246,18 +253,26 @@ def measure(directory, run_id, meta, latency=True):
         m["icmp_ratio"] = m.get("icmp_sent", 0) / m["sent"]
     if m.get("frag_datagrams"):
         m["frag_delivery_pct"] = sum(d("c", f"b{i}_udp_frag") for i in BACKENDS) / m["frag_datagrams"] * 100
-    # packet ที่มาถึง B = มากกว่าระหว่างที่ NIC ของ B นับได้ กับที่ A ส่งจริง (fragment ละ 2 ชิ้น)
+    # packet ที่มาถึง B = มากกว่าระหว่างที่ NIC ของ B นับได้ กับที่ A ส่งจริง (fragment นับทุกชิ้น)
     # ixgbe ทิ้ง packet ตอนคิวเต็มโดยไม่นับใน rx_packets หรือ rx_missed_errors จึงต้องเทียบกับฝั่ง A ด้วย
-    offered = m.get("sent", 0) + 2 * (m.get("frag_datagrams", 0) + m.get("flood_datagrams", 0))
+    offered = m.get("sent", 0) + m.get("frag_packets", 0)
     arrived = max(m["b_rx"], offered)
     if lb and offered > 0 and arrived > 0:
         m["loss_lb"] = max(0.0, (arrived - m["b_fwd"]) / arrived * 100)
-    # 3.3 3.4 วัดความถูกต้อง: x = สั่งให้ส่ง (target × เวลา), y = ที่เครื่องมือรายงานว่าส่ง, z = ที่สำเร็จ
+    # perf stat ของ B: 1.6 3.2 3.3 = CPU 0 (B ใช้ core เดียว) -> % ของ core 0  3.5 = ทุก CPU -> core รวม, CPU ที่ทำงานมากสุด
+    #   แล้วเวลาทำงานต่อ packet / datagram
+    busy = "b_cpu0_busy_s" if "b_cpu0_busy_s" in meta else "b_cpu_busy_s"
+    if busy in meta:
+        if busy == "b_cpu0_busy_s":
+            m["cpu0_pct"] = num(meta, "b_cpu0_busy_pct")
+        else:
+            m["cpu_cores"], m["cpu_hot_pct"] = num(meta, "b_cpu_cores"), num(meta, "b_cpu_hot_pct")
+        if arrived > 0:
+            m["cpu_ns_per_pkt"] = num(meta, busy) * 1e9 / arrived
+        if m.get("frag_datagrams"):
+            m["cpu_ns_per_datagram"] = num(meta, busy) * 1e9 / m["frag_datagrams"]
+    # 3.4 วัดความถูกต้อง: x = สั่งให้ส่ง (target × เวลา), y = ที่เครื่องมือรายงานว่าส่ง, z = ที่สำเร็จ
     seconds = num(meta, "duration") or m["fire_s"]
-    if meta.get("test") == "3.3" and m.get("frag_datagrams"):
-        m["x"], m["y"] = m["frag_datagrams_target_pps"] * seconds, m["frag_datagrams"]
-        m["z"] = sum(d("c", f"b{i}_udp_frag") for i in BACKENDS)
-        m["frag_share_pct"] = 2 * m["y"] / (2 * m["y"] + m.get("sent", 0)) * 100
     if meta.get("test") == "3.4" and m.get("sent"):
         m["x"], m["y"] = m["sent_target_pps"] * seconds, m["sent"]
         m["z"] = m.get("icmp_sent", 0) if meta.get("ip_size") == "1490" else delivered
@@ -273,10 +288,11 @@ def measure(directory, run_id, meta, latency=True):
         m[f"b{i}_throttled_pct"] = d("c", f"b{i}_throttled_usec") / (window_c * 1e6) * 100
         if packets > 0:
             m[f"b{i}_share"] = d("c", f"b{i}_rx_packets") / packets * 100
-    requests = [d("c", f"b{i}_requests") for i in BACKENDS]
-    if sum(requests) > 0:
-        for i, count in zip(BACKENDS, requests):
-            m[f"b{i}_req_pct"] = count / sum(requests) * 100
+    for name, key in (("req", "requests"), ("conn", "accepts")):
+        counts = [d("c", f"b{i}_{key}") for i in BACKENDS]
+        if sum(counts) > 0:
+            for i, count in zip(BACKENDS, counts):
+                m[f"b{i}_{name}_pct"] = count / sum(counts) * 100
     utils = [m[f"b{i}_util"] for i in BACKENDS]
     if statistics.mean(utils) > 0:
         m["balance"] = max(utils) / statistics.mean(utils)
@@ -292,7 +308,11 @@ def lb_cost(meta, m, idle):
     if meta.get("b_mode", "none") == "none" or "b_cores" not in m:
         return
     for kind in CPU_KINDS:
-        m[f"lb_{kind}"] = m[f"b_{kind}"] - idle.get(kind, 0.0)
+        if f"b_{kind}" in m:
+            m[f"lb_{kind}"] = m[f"b_{kind}"] - idle.get(kind, 0.0)
+    if "lb_perf" in m and m["b_fwd"] > 0:
+        m["perf_ns_per_fwd_pkt"] = m["lb_perf"] * m["fire_s"] * 1e9 / m["b_fwd"]
+        m["cycles_per_fwd_pkt"] = m["perf_ns_per_fwd_pkt"] * m["b_freq_ghz"]
     excess = m["lb_cores"] * m["fire_s"]
     if m["b_fwd"] > 0:
         m["ns_per_fwd_pkt"] = excess * 1e9 / m["b_fwd"]
@@ -307,10 +327,15 @@ def lb_cost(meta, m, idle):
 def exclusion(meta, m):
     if meta.get("traffic_error"):
         return "traffic_error"
-    # 3.3 3.4 วัดความถูกต้องเป็นสัดส่วน: hping3 ยิงไม่ถึงเป้ารายงานเป็น y/x แทนการตัดรอบ
-    #   และ hping3 ใช้ source port ใหม่ทุก datagram เกณฑ์ flow เดิม (EST) จึงใช้กับสองข้อนี้ไม่ได้
-    correctness = meta.get("test") in ("3.3", "3.4")
-    if meta.get("invalid") and not (correctness and meta["invalid"] == "rate"):
+    # B หา next-hop ของ C ไม่เจอ (neighbor หาย) packet ส่วนใหญ่ไม่ถึง backend: ปัญหาเส้นทาง ไม่ใช่ต้นทุนของ LB
+    if m.get("fib_failed", 0) > 0.01 * max(m.get("b_rx", 0), 1):
+        return "fib_failed"
+    # 3.4 วัดความถูกต้องเป็นสัดส่วน: hping3 ยิงไม่ถึงเป้ารายงานเป็น y/x แทนการตัดรอบ
+    #   และ hping3 ใช้ source port ใหม่ทุก datagram เกณฑ์ flow เดิม (EST) จึงใช้กับข้อนี้ไม่ได้
+    #   1.1 จุดที่เกินสาย (link_bound=1) ยิงไม่ถึงเป้าโดยธรรมชาติ: เก็บไว้ อ่านค่าจริงที่ sent_pps
+    correctness = meta.get("test") == "3.4"
+    link_limited = meta.get("test") == "1.1" and meta.get("link_bound") == "1"
+    if meta.get("invalid") and not ((correctness or link_limited) and meta["invalid"] == "rate"):
         return "invalid=" + meta["invalid"]
     ratio = m.get("conn_new_ratio")
     if ratio is not None and meta.get("profile") == "new" and ratio < 0.95:
@@ -355,7 +380,8 @@ def load(directory, prefix="", latency=True):
     for run in runs:
         meta = run["meta"]
         own = idle.get((meta.get("test"), meta.get("mode") or meta.get("variant"))) or idle_any.get(meta.get("test"))
-        baseline = {kind: statistics.mean(m[f"b_{kind}"] for m in own) for kind in CPU_KINDS} if own else {}
+        baseline = {kind: statistics.mean(m[f"b_{kind}"] for m in own) for kind in CPU_KINDS
+                    if own and all(f"b_{kind}" in m for m in own)}
         lb_cost(meta, run["m"], baseline if meta.get("kind") != "idle" else {})
         run["excluded"] = exclusion(meta, run["m"])
     cases = {}
@@ -418,7 +444,7 @@ def add_omega(cases, caps):
         if not in_test(meta, "4") or meta.get("level") != "sat":
             continue
         cap = caps.get((meta.get("c0_scenario"), meta.get("workload")), {}).get("c0")
-        before = caps.get(("balanced", meta.get("workload")), {}).get("c0")
+        before = caps.get(("1-1-1", meta.get("workload")), {}).get("c0")      # 4.4 ก่อนเปลี่ยน quota
         for run in case["runs"]:
             c0 = cap
             if meta.get("scenario") == "dynamic":
@@ -477,6 +503,14 @@ def write_csv(directory, cases, runs):
                                    "" if s["cv"] is None else s["cv"]])
 
 
+def sibling_c0(directory):
+    """C0 จาก <ชุด>/0.*/c0.tsv  ใช้เมื่อโฟลเดอร์นี้ไม่มีผลข้อ 0 (tcase รันแต่ละข้อในโฟลเดอร์ของตัวเอง)"""
+    caps = {}
+    for path in sorted(directory.resolve().parent.glob("0.*/c0.tsv")):
+        caps.update(c0_table(path.parent))
+    return caps
+
+
 def loaded(directory, prefix="", latency=True):
     cases, runs = load(directory, prefix, latency)
     for case in cases.values():
@@ -487,7 +521,8 @@ def loaded(directory, prefix="", latency=True):
 def report(directory):
     cases, runs = loaded(directory)
     caps = capacities(cases)
-    add_omega(cases, caps)
+    c0_caps = caps or sibling_c0(directory)               # ข้อ 4 ในโฟลเดอร์ของตัวเอง: C0 จาก 0.*
+    add_omega(cases, c0_caps)
     for case in cases.values():
         case["stats"] = stats_of(case)
     by_test = lambda number, **match: [c for c in cases.values() if in_test(c["meta"], number)
@@ -509,10 +544,20 @@ def report(directory):
     table("ข้อ 1.1  UDP (pktgen): CPU ของ B ต่อ packet ที่ส่งต่อสำเร็จ", test11, ["mode", "size", "pps", "link_bound"],
           ["sent_pps", "lb_cores", "lb_usr", "lb_sys", "lb_soft", "ns_per_fwd_pkt", "loss_lb", "loss_e2e", "q_share",
            "a_cores", "c_cores", "c_rx_drops"], "ns_per_fwd_pkt")
-    for mode in dict.fromkeys(c["meta"]["mode"] for c in test11):
-        ok = [num(c["meta"], "pps") for c in test11 if c["meta"]["mode"] == mode and c["meta"]["size"] == "64"
-              and c["meta"].get("link_bound") != "1" and c["stats"].get("loss_lb", {}).get("mean", 100) <= 0.1]
-        print(f"  usable capacity {mode}: {max(ok):.0f} pps" if ok else f"  usable capacity {mode}: ต่ำกว่าระดับแรก")
+    for mode, size in dict.fromkeys((c["meta"]["mode"], c["meta"]["size"]) for c in test11):
+        group = [c for c in test11 if (c["meta"]["mode"], c["meta"]["size"]) == (mode, size)]
+        if len(group) < 2:                  # ขนาดที่ยิง pps ระดับเดียว (size sweep เดิม) ไม่มี capacity
+            continue
+        ok = [num(c["meta"], "pps") for c in group
+              if c["meta"].get("link_bound") != "1" and c["stats"].get("loss_lb", {}).get("mean", 100) <= 0.1]
+        print(f"  usable capacity {mode} {size} B: {max(ok):.0f} pps" if ok
+              else f"  usable capacity {mode} {size} B: ต่ำกว่าระดับแรก")
+    test15 = by_test("1.5")
+    table("ข้อ 1.5  UDP (pktgen): CPU ของ B ต่อ packet จาก perf cycles (หัก idle)", test15, ["mode", "size", "pps"],
+          ["sent_pps", "lb_perf", "perf_ns_per_fwd_pkt", "cycles_per_fwd_pkt", "lb_cores", "loss_lb", "loss_e2e"],
+          "perf_ns_per_fwd_pkt")
+    if test15:
+        print("  lb_perf = core จาก cycle ของ CPU ทุก core รวม softirq (แฟร์ทุก LB)  lb_cores = แบบ mpstat ไว้เทียบ")
     table("ข้อ 1.2  HTTP 1 KB: CPU ของ B ต่อ request", by_test("1.2"), ["mode", "workload", "level"],
           ["req_s", "cpu_us_per_req", "lb_cores", "lb_usr", "lb_sys", "lb_soft", "p50_ms", "p99_ms", "p999_ms",
            "error_rate", "a_cores"],
@@ -539,29 +584,34 @@ def report(directory):
     table("ข้อ 2  เวลาเลือก rule ต่อ packet (flow NEW)  xdp = ทั้งโปรแกรม (bpf_stats)  nft/ipt = ฟังก์ชันประเมิน rule"
           " (bpftrace)  d_ = เทียบ VIP 1", test2, ["test", "mode", "vips", "pattern", "pps"],
           ["sent_pps", "lookup_ns", "d_lookup_ns", "lookup_calls_per_pkt", "conn_new_ratio", "loss_lb"], "lookup_ns")
-    table("ข้อ 3.0-3.2  ต้นทุนทีละขั้น (bpf_stats เปิด)", by_test("3.0") + by_test("3.1") + by_test("3.2"),
+    table("ข้อ 3.0-3.1  ต้นทุนทีละขั้น (bpf_stats เปิด)", by_test("3.0") + by_test("3.1"),
           ["test", "variant", "profile", "pps"],
           ["sent_pps", "xdp_ns", "ns_per_fwd_pkt", "lb_cores", "loss_lb", "loss_e2e", "conn_new_ratio"], "xdp_ns")
-    test33 = by_test("3.3")
-    reference = [c for c in by_test("3.2", profile="est") if test33 and c["meta"]["pps"] == test33[0]["meta"]["pps"]]
-    reference = [dict(case, meta=dict(case["meta"], frag_pct="0 (3.2)")) for case in reference]
-    table("ข้อ 3.3  fragment ปนกับ UDP ปกติ  x = datagram ที่สั่ง hping3, y = ที่ hping3 ส่งจริง, z = backend ประกอบได้"
-          "  frag_share_pct = สัดส่วน fragment จริง", reference + test33, ["frag_pct", "pps"],
-          ["x", "y", "y_pct", "z", "z_pct", "frag_share_pct", "frag_miss", "xdp_ns", "loss_lb"], "z_pct")
+    table("ข้อ 3.2  ปิด/เปิด fragment handling กับ UDP 64 B ปกติ  cpu0_pct = % ของ core 0 (B ใช้ 1 core)"
+          "  cpu_cores = core รวม (ชุด allcore)", by_test("3.2"), ["fragment", "pps"],
+          ["sent_pps", "cpu0_pct", "cpu_cores", "cpu_hot_pct", "cpu_ns_per_pkt", "loss_lb"], "cpu_ns_per_pkt")
+    table("ข้อ 3.3  fragment อย่างเดียว ปิด/เปิด fragment handling (2 ชิ้นต่อ datagram)"
+          "  frag_delivery_pct = % datagram ที่ backend ประกอบได้", by_test("3.3"), ["fragment", "dps", "pps"],
+          ["frag_dps", "frag_delivery_pct", "cpu0_pct", "cpu_cores", "cpu_hot_pct", "cpu_ns_per_pkt", "cpu_ns_per_datagram"],
+          "cpu_ns_per_pkt")
     table("ข้อ 3.4  PMTU (DF)  x = ที่สั่ง, y = ที่ส่งจริง, z = 1470 B: ถึง backend / 1490 B: ICMP frag-needed",
           by_test("3.4"), ["ip_size", "pps"], ["x", "y", "y_pct", "z", "z_pct", "icmp_ratio", "xdp_ns"], "z_pct")
-    table("ข้อ 3.5  frag cache ถูกท่วม: flow ปกติระหว่าง flood source สุ่ม", by_test("3.5"),
-          ["flood_rate", "frag_flow_rate", "b_frag_cache_map_max", "b_frag_timeout_s"],
-          ["flood_dps", "frag_delivery_pct", "frag_hit", "frag_miss", "frag_store_failed", "lb_cores", "xdp_ns"],
-          "frag_delivery_pct")
+    table("ข้อ 3.5  จำนวน fragment ต่อ datagram (fragment handling เปิด, packet/s เท่ากันทุก N)",
+          by_test("3.5"), ["frags", "pps", "dps"],
+          ["frag_dps", "frag_delivery_pct", "frag_miss", "cpu_cores", "cpu_ns_per_pkt", "cpu_ns_per_datagram"],
+          "cpu_ns_per_pkt")
 
     latency = ["req_s", "p50_ms", "p99_ms", "p999_ms", "error_rate", "balance"]
     backend = ["b1_util", "b2_util", "b3_util", "b1_req_pct", "b2_req_pct", "b3_req_pct",
+               "b1_conn_pct", "b2_conn_pct", "b3_conn_pct",
                "b1_throttled_pct", "b2_throttled_pct", "b3_throttled_pct", "conn_new", "awfd_dispatched"]
-    for test in ("4.1", "4.2", "4.3", "4.4"):
+    table("ข้อ 4.0  baseline ไม่ผ่าน LB  fit = แบ่งตามความสามารถ, equal = แบ่งเท่ากัน, single = backend ตัวเดียว sat",
+          by_test("4.0"), ["baseline", "scenario", "quota_pct", "level", "rate"],
+          latency + ["b1_util", "b2_util", "b3_util", "b1_req_pct", "b2_req_pct", "b3_req_pct"], "p99_ms", SAT_NOTE)
+    for test in ("4.1", "4.2", "4.3", "4.5", "4.4"):
         for workload in dict.fromkeys(c["meta"].get("workload") for c in by_test(test)):
             rows = by_test(test, workload=workload)
-            flag = "  [link-bound]" if caps.get((rows[0]["meta"].get("c0_scenario"), workload), {}).get("link_bound") else ""
+            flag = "  [link-bound]" if c0_caps.get((rows[0]["meta"].get("c0_scenario"), workload), {}).get("link_bound") else ""
             table(f"ข้อ {test}  อัลกอริทึม  workload={workload}{flag}", rows, ["scenario", "mode", "algo", "level", "rate"],
                   latency[:1] + ["omega"] + latency[1:] + backend + (["convergence_s"] if test == "4.4" else []),
                   "p99_ms", SAT_NOTE)
@@ -571,7 +621,8 @@ def report(directory):
                     print(f"  ! {case['meta'].get('mode', 'xdp')} {case['meta']['algo']}: Ω = {omega['mean']:.3f} < 0.9  มี backend ที่แทบไม่ได้งาน")
 
     print("\nΩ = throughput ÷ C0 (เฉพาะ sat)   balance = util สูงสุด ÷ util เฉลี่ย   conn_new ควร >> 128 (connection เริ่มต้น)"
-          "\nb<i>_req_pct = สัดส่วน request ที่ backend i ตอบ (nginx stub_status)"
+          "\nb<i>_req_pct = สัดส่วน request ที่ backend i ตอบ   b<i>_conn_pct = สัดส่วน connection ที่ LB ส่งไป backend i"
+          " (accepts)  ทั้งสองจาก nginx stub_status"
           "   b<i>_throttled_pct = % ของเวลาที่ backend i ใช้ CPU เกิน quota จนถูกหยุด (cgroup)")
 
     excluded = [(run["id"], run["excluded"]) for run in runs if run["excluded"] and run["meta"].get("kind") != "idle"]

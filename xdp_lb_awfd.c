@@ -14,14 +14,18 @@
 #define MISSED_ROUNDS_LIMIT 3
 
 static const char usage[] =
-    "usage: xdp_lb_awfd [-m max_weight] [-i interval_ms] [--static]\n"
+    "usage: xdp_lb_awfd [-m max_weight] [-i interval_ms] [-a ewma_pct] [-f floor_pct] [-v] [--static]\n"
     "  -m        largest weight m, 1..16 (default 4, Figure 10)\n"
     "  -i        polling interval in ms (default 500, Figure 12)\n"
+    "  -a        EWMA weight of the newest U in %, 1..100 (default 100 = no smoothing)\n"
+    "  -f        share of C always counted as available in %, 0..100 (default 0)\n"
+    "  -v        print U, smoothed U and weight of every backend each round\n"
     "  --static  weights from capacity C only (WCMP) instead of available capacity\n";
 
 struct probed_backend {
     __be32 address;
     __u32 utilization_milli;
+    __u32 smoothed_milli;
     __u32 capacity_milli;
     __u32 missed_rounds;
 };
@@ -32,6 +36,9 @@ static size_t probed_count;
 static __u32 max_weight = 4;
 static long long interval_ms = 500;
 static int static_weights;
+static __u32 ewma_pct = 100;
+static __u32 floor_pct;
+static int verbose;
 
 static long long now_ms(void)
 {
@@ -73,9 +80,10 @@ static __u32 backend_available(const struct probed_backend *backend)
         return 0;
     if (static_weights)
         return backend->capacity_milli;
-    if (backend->utilization_milli >= AWFD_MILLI)
-        return 0;
-    return (__u64)(AWFD_MILLI - backend->utilization_milli) * backend->capacity_milli / AWFD_MILLI;
+    __u32 spare = backend->smoothed_milli < AWFD_MILLI ? AWFD_MILLI - backend->smoothed_milli : 0;
+    __u32 share = floor_pct * AWFD_MILLI / 100 + (100 - floor_pct) * spare / 100;
+
+    return (__u64)share * backend->capacity_milli / AWFD_MILLI;
 }
 
 static __u32 build_vip_classes(const __be32 *addresses, int count, struct awfd_classes *classes)
@@ -89,11 +97,21 @@ static __u32 build_vip_classes(const __be32 *addresses, int count, struct awfd_c
     }
 
     *classes = (struct awfd_classes){};
+    if (verbose)
+        printf("%lld", now_ms());
     for (int slot = 0; slot < count; slot++) {
         __u32 weight = max_available ? (__u64)max_weight * available[slot] / max_available : 0;
+        struct probed_backend *backend = find_probed(addresses[slot], 0);
 
+        if (verbose && backend)
+            printf(" %s U=%u Us=%u w=%u", inet_ntoa((struct in_addr){ addresses[slot] }),
+                   backend->utilization_milli, backend->smoothed_milli, weight);
         if (weight)
             classes->members[weight - 1][classes->class_size[weight - 1]++] = slot;
+    }
+    if (verbose) {
+        putchar('\n');
+        fflush(stdout);
     }
     for (__u32 class = 0; class < AWFD_MAX_WEIGHT; class++) {
         classes->weight_sum += (class + 1) * classes->class_size[class];
@@ -130,6 +148,8 @@ static void probe_backends(int sock, __u32 sequence, long long deadline)
             !(backend = find_probed(from.sin_addr.s_addr, 0)) || backend->missed_rounds == 0)
             continue;
         backend->utilization_milli = ntohl(reply.utilization_milli);
+        backend->smoothed_milli = backend->missed_rounds > MISSED_ROUNDS_LIMIT ? backend->utilization_milli :
+            (ewma_pct * backend->utilization_milli + (100 - ewma_pct) * backend->smoothed_milli) / 100;
         backend->capacity_milli = ntohl(reply.capacity_milli);
         backend->missed_rounds = 0;
         pending--;
@@ -187,17 +207,24 @@ int main(int argc, char **argv)
     static const struct option options[] = { { "static", no_argument, NULL, 's' }, {} };
     int option, vip_fd, backend_fd, awfd_fd, sock;
 
-    while ((option = getopt_long(argc, argv, "m:i:", options, NULL)) != -1) {
+    while ((option = getopt_long(argc, argv, "m:i:a:f:v", options, NULL)) != -1) {
         if (option == 'm')
             max_weight = atoi(optarg);
         else if (option == 'i')
             interval_ms = atoi(optarg);
+        else if (option == 'a')
+            ewma_pct = atoi(optarg);
+        else if (option == 'f')
+            floor_pct = atoi(optarg);
+        else if (option == 'v')
+            verbose = 1;
         else if (option == 's')
             static_weights = 1;
         else
             break;
     }
-    if (option != -1 || optind != argc || max_weight < 1 || max_weight > AWFD_MAX_WEIGHT || interval_ms < 1) {
+    if (option != -1 || optind != argc || max_weight < 1 || max_weight > AWFD_MAX_WEIGHT || interval_ms < 1 ||
+        ewma_pct < 1 || ewma_pct > 100 || floor_pct > 100) {
         fputs(usage, stderr);
         return 1;
     }

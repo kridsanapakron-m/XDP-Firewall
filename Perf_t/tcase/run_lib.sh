@@ -1,194 +1,71 @@
 #!/bin/bash
-# ส่วนกลางของ tcase/<ข้อ>.sh: matrix, การสั่ง B/C, เครื่องมือยิง, ขั้นของหนึ่งรอบ, plan/eta, เริ่ม/จบการรัน
-# ไม่ได้รันตรง ๆ  ไฟล์ข้อย่อย source ไฟล์นี้แล้วเรียก run_one <ข้อ> "$@"   รายละเอียดของแต่ละข้ออยู่ใน ../00_overview.txt
-# ย้ายมาจาก ../run_tests.sh ด้วย logic เดิม  ต่างกันที่ run_case ถูกแยกเป็นขั้น (round_begin ... round_end)
-# ให้ไฟล์ข้อย่อยเรียกเองตามลำดับ และคำสั่งที่เปลี่ยนสภาพเครื่องแสดงบนจอเป็น A$ / B$ / C$
-#
-# ===== ตั้งเครื่องครั้งแรก (ทำครั้งเดียวก่อนรันข้อไหนก็ได้) =====
-# ด้วยสคริปต์ตามลำดับ:  C# ./setup_c_server.sh up   B# ./setup_b_lb.sh up   A# ./setup_a_client.sh up && ./setup_a_client.sh check
-# ข้างล่างคือคำสั่งที่ให้ผลเท่ากัน ใช้ทำมือได้ (copy ไปวางบนเครื่องนั้นด้วย root)
-#
-# --- C (server): backend 3 ตัวใน netns + ตัวถอด IPIP + nginx/iperf ใน cgroup + agent ของ AWFD ---
-#   source /root/XDP-Firewall/Perf_t/perf_env.sh
-#   make -C $REPO xdp_lb_deencap.o xdp_lb_agent
-#   for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $g; done
-#   systemctl stop irqbalance
-#   c=0; for irq in $(awk -v d=$SERVER_IFACE '$0 ~ d {sub(":", "", $1); print $1}' /proc/interrupts); do
-#       echo $((c % QUEUES)) > /proc/irq/$irq/smp_affinity_list; c=$((c + 1)); done
-#   sysctl -w net.ipv4.ip_forward=1
-#   for s in all default $SERVER_IFACE; do
-#       sysctl -w net.ipv4.conf.$s.rp_filter=0 net.ipv4.conf.$s.accept_redirects=0 net.ipv4.conf.$s.send_redirects=0; done
-#   mkdir -p $WEBROOT
-#   for f in 1k:1 10k:10 100k:100 1m:1024; do
-#       dd if=/dev/urandom of=$WEBROOT/f${f%%:*} bs=1024 count=${f##*:} status=none; done
-#   for i in 1 2 3; do
-#       ip netns add server_$i
-#       ip link add vh$i type veth peer name vn$i
-#       ip link set vn$i netns server_$i
-#       ip addr add $(backend_host_ip $i)/30 dev vh$i
-#       ip link set vh$i up mtu 1600
-#       sysctl -w net.ipv4.conf.vh$i.rp_filter=0
-#       ip -n server_$i link set lo up
-#       ip -n server_$i addr add $(backend_ip $i)/30 dev vn$i
-#       ip -n server_$i link set vn$i up mtu 1600
-#       ip -n server_$i route add default via $(backend_host_ip $i) dev vn$i
-#       ip -n server_$i addr add $VIP/32 dev lo
-#       ip -n server_$i route add local 10.100.0.0/16 dev lo
-#       ip netns exec server_$i sysctl -w net.ipv4.conf.all.rp_filter=0 \
-#           net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2
-#       ip -n server_$i link set dev vn$i xdpgeneric obj $REPO/xdp_lb_deencap.o sec xdp
-#       ip netns exec server_$i nft -f - <<NFT
-#   table inet perf_sink {
-#       counter udp_in {}
-#       counter udp_frag_in {}
-#       chain input {
-#           type filter hook input priority 0; policy accept;
-#           udp dport $VPORT counter name udp_in drop
-#           ip saddr $CLIENT_IP udp dport $VPORT_FRAG counter name udp_frag_in drop
-#           udp dport $VPORT_FRAG drop
-#       }
-#   }
-#   NFT
-#       mkdir -p /tmp/perf-nginx-$i
-#       cat > /etc/nginx/perf-backend-$i.conf <<NGINX
-#   worker_processes 1;
-#   worker_rlimit_nofile 65536;
-#   pid /run/perf-nginx-$i.pid;
-#   error_log /var/log/perf-nginx-$i.err warn;
-#   events { worker_connections 8192; }
-#   http {
-#       access_log off;
-#       sendfile on;
-#       keepalive_requests $KEEPALIVE_REQS;
-#       default_type application/octet-stream;
-#       client_body_temp_path /tmp/perf-nginx-$i/body;
-#       proxy_temp_path       /tmp/perf-nginx-$i/proxy;
-#       fastcgi_temp_path     /tmp/perf-nginx-$i/fastcgi;
-#       uwsgi_temp_path       /tmp/perf-nginx-$i/uwsgi;
-#       scgi_temp_path        /tmp/perf-nginx-$i/scgi;
-#       server {
-#           listen $VIP:$VPORT backlog=8192 reuseport;
-#           listen $(backend_ip $i):$VPORT backlog=8192 reuseport;
-#           root $WEBROOT;
-#           location = /id { return 200 "backend-$i\n"; }
-#           location = /nginx_status { stub_status; allow $(backend_ip $i); deny all; }
-#       }
-#   }
-#   NGINX
-#       systemd-run --quiet --scope --unit backend$i -p AllowedCPUs=$(backend_cpus $i) \
-#           -p CPUQuota=100% -p CPUQuotaPeriodSec=10ms sh -c "ip netns exec server_$i nginx -c /etc/nginx/perf-backend-$i.conf &&
-#               ip netns exec server_$i iperf -s -p $IPERF_PORT -D" < /dev/null >> /var/log/perf-backend-$i.log 2>&1
-#       setsid taskset -c $AGENT_CPU nsenter --net=/var/run/netns/server_$i -- \
-#           $REPO/xdp_lb_agent $(backend_ip $i) /sys/fs/cgroup/system.slice/backend$i.scope \
-#           > /var/log/perf-agent-$i.log 2>&1 < /dev/null &
-#   done
-#   (แล้วตั้ง mode ของ C เป็น guarded ตามบล็อก "C: mode" ในไฟล์ข้อย่อย)
-#
-# --- B (LB) ---
-#   source /root/XDP-Firewall/Perf_t/perf_env.sh
-#   make -C $REPO xdp_lb.o xdp_lb_ctl xdp_lb_awfd
-#   for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $g; done
-#   systemctl stop irqbalance nginx haproxy
-#   c=0; for irq in $(awk -v d=$LB_IFACE '$0 ~ d {sub(":", "", $1); print $1}' /proc/interrupts); do
-#       echo $((c % QUEUES)) > /proc/irq/$irq/smp_affinity_list; c=$((c + 1)); done
-#   (TUNE_NIC=1 เท่านั้น ห้ามรันกับ X540 ของ B บน lab เพราะหลุดจาก PCIe:
-#    ethtool -L $LB_IFACE combined $QUEUES; ethtool -N $LB_IFACE rx-flow-hash udp4 sdfn; ethtool -N $LB_IFACE rx-flow-hash tcp4 sdfn)
-#   sysctl -w net.ipv4.ip_forward=1
-#   for s in all default $LB_IFACE; do
-#       sysctl -w net.ipv4.conf.$s.rp_filter=0 net.ipv4.conf.$s.send_redirects=0 net.ipv4.conf.$s.accept_redirects=0; done
-#   ip addr add $VIP/32 dev $LB_IFACE
-#   for i in 1 2 3; do ip route replace $(backend_ip $i)/32 via $SERVER_IP dev $LB_IFACE; ping -c 1 -W 1 $(backend_ip $i); done
-#   (แล้วตั้ง mode xdp ตามบล็อก "B: mode xdp" ในไฟล์ข้อย่อย)
-#
-# --- A (client) ---
-#   source <repo บน A>/Perf_t/perf_env.sh
-#   modprobe pktgen
-#   for s in all default $CLIENT_IFACE; do sysctl -w net.ipv4.conf.$s.rp_filter=0 net.ipv4.conf.$s.accept_redirects=0; done
-#   ip route replace $VIP/32 dev $CLIENT_IFACE mtu lock $VIP_MTU
-#   ip route replace 192.168.200.0/22 via $SERVER_IP dev $CLIENT_IFACE mtu lock $VIP_MTU
-#   curl -s http://$VIP:$VPORT/id                      # ตรวจว่า VIP ตอบ (ได้ backend-1..3 สลับกัน)
-#
-# shellcheck disable=SC2086,SC2046,SC2206,SC2029,SC2034   # แยกคำโดยตั้งใจ, ตัวแปรใช้ในไฟล์ข้อย่อย
 set -e
 
 TCASE_DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
-SCRIPT_DIR=$(dirname "$TCASE_DIR")                  # Perf_t: perf_env.sh, report.py, results/
-# shellcheck source=../perf_env.sh
+SCRIPT_DIR=$(dirname "$TCASE_DIR")
 source "$SCRIPT_DIR/perf_env.sh"
-# ผลของชุดการทดลอง: results/<CAMPAIGN>/<ข้อ>/  ตั้ง RUN_DIR เอง = ใช้โฟลเดอร์นั้นแทน
 CAMPAIGN=${CAMPAIGN:-20261018}
 RESULTS=$SCRIPT_DIR/results/$CAMPAIGN
 USER_RUN_DIR=${RUN_DIR:-}
 RUN_DIR=${RUN_DIR:-$RESULTS}
 
-# --- matrix กลาง (ตัวเลขตรงกับ 00_overview.txt หัวข้อ 7) ---
-DURATION=${DURATION:-20}                  # วินาทีต่อรอบของ UDP
-HTTP_DURATION=${HTTP_DURATION:-40}        # วินาทีต่อรอบของ HTTP และ iperf (wrk2 ใช้ ~10 s แรกปรับเทียบ)
-HTTP_DURATION_DYNAMIC=${HTTP_DURATION_DYNAMIC:-60}  # 4.4: ต้องมีเวลาหลังเปลี่ยน quota
-IDLE_DURATION=${IDLE_DURATION:-10}        # รอบ idle (ไม่มี traffic) ของข้อ 1 และ 3
-REPS_UDP=${REPS_UDP:-${REPS:-10}}         # ข้อ 1.1  ชุดใหม่ใช้ 10 rep ทุกข้อ
+DURATION=${DURATION:-20}
+HTTP_DURATION=${HTTP_DURATION:-40}
+HTTP_DURATION_DYNAMIC=${HTTP_DURATION_DYNAMIC:-60}
+IDLE_DURATION=${IDLE_DURATION:-10}
+REPS_UDP=${REPS_UDP:-${REPS:-10}}
 REPS_TEST2=${REPS_TEST2:-${REPS:-10}}
 REPS_TEST3=${REPS_TEST3:-${REPS:-10}}
 REPS_HTTP=${REPS_HTTP:-${REPS:-10}}
-SETTLE=${SETTLE:-1}                       # วินาทีหลัง reset ก่อนยิง
-RESUME=${RESUME:-1}                       # 1 = ข้ามรอบที่เสร็จแล้ว (มี t_end_ns ไม่มี traffic_error/invalid)
-OVERHEAD=${OVERHEAD:-}                    # วินาทีที่เสียต่อรอบของ plan  ว่าง = ค่าเฉลี่ยที่วัดได้ใน RUN_DIR หรือ 5
-PPS_LADDER=${PPS_LADDER:-"50000 100000 250000 500000 1000000"}  # frame 64 B  ต่ำกว่าขาออกหลังห่อ IPIP (~1.20 Mpps)
-SIZES=${SIZES:-"64 512 1024 1400"}        # ขนาด frame (รวม FCS)
-SIZE_SWEEP_PPS=${SIZE_SWEEP_PPS:-50000}   # ระดับเดียวที่ทุกขนาดทำได้แม้ห่อ IPIP
-STRESS_PPS=${STRESS_PPS:-}                # เช่น 1200000  ติดป้าย link_bound=1  (ปิดไว้)
+SETTLE=${SETTLE:-1}
+RESUME=${RESUME:-1}
+OVERHEAD=${OVERHEAD:-}
+PPS_LADDER=${PPS_LADDER:-"50000 100000 250000 500000 750000 1000000"}
+SIZES=${SIZES:-"64 512 1024 1400"}
+SIZE_SWEEP_PPS=${SIZE_SWEEP_PPS:-50000}
+STRESS_PPS=${STRESS_PPS:-}
 PKTGEN_THREADS=${PKTGEN_THREADS:-2}
-SRC_PER_THREAD=125                        # thread t ใช้ source FLOW_SRC_BASE + 125t .. +124
-EST_PORTS=${EST_PORTS:-4}                 # EST: 125 IP x 4 port = 500 tuple ต่อ thread (2 thread = 1,000)
-NEW_PORTS=${NEW_PORTS:-64511}             # NEW: 125 x 64,511 (coprime) = 8.06M ต่อ thread  ไม่วนซ้ำในรอบ
+SRC_PER_THREAD=125
+EST_PORTS=${EST_PORTS:-4}
+NEW_PORTS=${NEW_PORTS:-64511}
 CONNS=${CONNS:-128}
 HTTP_THREADS=${HTTP_THREADS:-4}
-SAT_RATE=${SAT_RATE:-2000000}             # -R ของ wrk2 ตอน sat: สูงเกินจริงจนเป็น closed-loop
-STREAMS=${STREAMS:-16}                    # stream ของ iperf
-WEB_FILES=${WEB_FILES:-"1k 10k 100k 1m mix"}  # web-mix = 1k 70%, 10k 20%, 100k 9%, 1m 1%
+SAT_RATE=${SAT_RATE:-2000000}
+STREAMS=${STREAMS:-16}
+WEB_FILES=${WEB_FILES:-"1k 10k 100k 1m mix"}
 HTTP_TOOL=${HTTP_TOOL:-$(command -v wrk2 >/dev/null && echo wrk2 || echo h2load)}
-RAW_TOOL=${RAW_TOOL:-hping3}              # ข้อ 3.3 3.4: hping3 หรือ tcpreplay (pcap ที่สร้างไว้ก่อน)
+RAW_TOOL=${RAW_TOOL:-hping3}
 
-# --- ค่าของแต่ละข้อ ---
 TEST1_MODES=${TEST1_MODES:-"xdp ipvs nft ipt nginx haproxy"}
-TEST12_LEVELS=${TEST12_LEVELS:-75}        # ข้อ 1.2 % ของ C0 (+ sat)  CPU ต่อ request แทบไม่เปลี่ยนตาม load
-LAT_RATE=${LAT_RATE:-1000}                # ข้อ 1.4 req/s รวม
-VIP_COUNTS=${VIP_COUNTS:-"1 10 100 1000"} # 10000 ต้องขยาย MAX_VIPS ก่อน
-TEST2_PPS=${TEST2_PPS:-40000}             # NEW ไม่เกิน conntrack max (40k x 20 s = 800k)
+TEST12_LEVELS=${TEST12_LEVELS:-75}
+LAT_RATE=${LAT_RATE:-1000}
+VIP_COUNTS=${VIP_COUNTS:-"1 10 100 1000"}
+TEST2_PPS=${TEST2_PPS:-40000}
 TEST3_PPS=${TEST3_PPS:-"500000 100000"}
-FRAG_TOTAL_PPS=${FRAG_TOTAL_PPS:-100000}  # ข้อ 3.3 อัตรารวม (packet/s)
-FRAG_PERCENTS=${FRAG_PERCENTS:-"10 20 50 70 90"}  # ระดับ 0% คือ 3.2 ที่ 100k EST
 PMTU_PPS=${PMTU_PPS:-50000}
-FLOOD_RATE=${FLOOD_RATE:-100000}          # ข้อ 3.5 datagram/s source สุ่ม
-FRAG_FLOW_RATE=${FRAG_FLOW_RATE:-1000}    # ข้อ 3.5 datagram/s ของ flow ปกติ
-# ข้อ 4: <LB>:<อัลกอริทึม>  least-connection ของ LB อื่นใส่น้ำหนัก = quota ตอนเริ่มรอบ
-#   รันหนึ่งครั้งต้องเป็น xdp ทั้งหมดหรือ LB อื่นทั้งหมด (สลับมี/ไม่มี XDP ทำให้การ์ดของ B reset ทุก rep)
-TEST4_VARIANTS=${TEST4_VARIANTS:-"xdp:ecmp xdp:wcmp xdp:awfd4"}  # LB อื่น: ipvs:rr ipvs:wlc nft:rr ipt:rr nginx:least_conn haproxy:leastconn
-TEST4_LEVELS=${TEST4_LEVELS:-${LOAD_LEVELS:-"50 75 90"}}  # ข้อ 4: % ของ C0 แบบ open-loop
-TEST4_SAT_REPS=${TEST4_SAT_REPS:-1}       # sat ของข้อ 4 แยกออกมา รอบต่อคู่ (algo, ไฟล์) ไว้เช็ค Ω < 0.9
-declare -A QUOTA=(                        # CPUQuota ของ backend 1 2 3  (100% = 1 core)
-    [equal]=${QUOTA_EQUAL:-"100% 100% 100%"}            # ข้อ 0.1 1 3
-    [unequal]=${QUOTA_UNEQUAL:-"100% 50% 25%"}          # ข้อ 5
-    # ข้อ 4: CPU รวม 0.9 core ทุกแบบ  web-1k ได้ ~52k req/s (~540 Mbit/s) backend จึงตันก่อนสาย 1G
-    [balanced]=${QUOTA_BALANCED:-"30% 30% 30%"}
-    [skewed]=${QUOTA_SKEWED:-"60% 20% 10%"}
-    [oneslow]=${QUOTA_ONESLOW:-"40% 40% 10%"}
-    [dynamic_after]=${QUOTA_DYNAMIC_AFTER:-"30% 30% 10%"}   # ข้อ 4.4: เริ่ม balanced แล้วเปลี่ยนที่ 1/3 ของรอบ
+TEST4_VARIANTS=${TEST4_VARIANTS:-"xdp:ecmp xdp:wcmp xdp:awfd4"}
+TEST4_LEVELS=${TEST4_LEVELS:-${LOAD_LEVELS:-"50 75 90"}}
+TEST4_AWFD_TUNE=${TEST4_AWFD_TUNE:-"30 25"}
+TEST4_SAT_REPS=${TEST4_SAT_REPS:-1}
+declare -A QUOTA=(
+    [equal]=${QUOTA_EQUAL:-"100% 100% 100%"}
+    [unequal]=${QUOTA_UNEQUAL:-"100% 50% 25%"}
+    [1-1-1]="40% 40% 40%"
+    [1-1-0.5]="40% 40% 20%"
+    [1-0.5-0.5]="40% 20% 20%"
+    [1-0.5-0.25]="40% 20% 10%"
+    [dynamic_after]="40% 40% 20%"
 )
-TEST4_SCENARIOS="balanced skewed oneslow dynamic_after"   # C0 ของข้อ 4 (ข้อ 0.3)
+TEST4_SCENARIOS="1-1-1 1-1-0.5 1-0.5-0.5 1-0.5-0.25"
 
-PLAN=""                                   # ไม่ว่าง = นับรอบอย่างเดียว ไม่ยิงจริง (plan และเวลาที่คาดว่าจะเสร็จ)
-LAST_END_NS=""                            # t_end ของรอบก่อน ใช้คิดเวลาเสียต่อรอบ (gap_ms)
-declare -A RAN=()                         # รอบที่ผ่าน run_case แล้วในการรันครั้งนี้
+PLAN=""
+LAST_END_NS=""
+declare -A RAN=()
 
-# ssh ครั้งแรกเปิด connection ค้างไว้ 10 นาที ครั้งต่อไปใช้ซ้ำ (ไม่ต้อง handshake ทุกคำสั่ง)
 ssh_options="-o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPersist=10m"
 
-# shellcheck source=cmd.sh
-source "$TCASE_DIR/cmd.sh"                          # cmd field delta ratio  (ใช้ ssh_options ข้างบน)
+source "$TCASE_DIR/cmd.sh"
 
-# --- สั่งเครื่อง: คำสั่งที่เปลี่ยนสภาพเครื่องแสดงบนจอเป็น A$ B$ C$ และต่อท้าย env-a.txt (ยกเว้นที่ทำทุกรอบ) ---
-# setup_log <เครื่อง> <คำสั่งย่อย> <คำสั่งเต็ม>
 setup_log() {
     case $2 in snapshot|cpu|status|env) return 0 ;; esac
     echo "  $1\$ $3" >&2
@@ -202,19 +79,13 @@ vip_route() {
         ip route replace $VIP/32 dev $CLIENT_IFACE "$@"
     fi
 }
-note() { echo "$*" >&2; if [ -z "$PLAN" ]; then echo "$*" >> "$RUN_DIR/env-a.txt"; fi; }   # การตัดสินใจอัตโนมัติ
 c_mode_for() { case $1 in nft|ipt) echo nat ;; *) echo guarded ;; esac; }
 gcd() { if (( $2 )); then gcd $2 $(( $1 % $2 )); else echo $1; fi; }
 lcm() { echo $(( $1 * $2 / $(gcd $1 $2) )); }
-share() { echo $(( $1 * $2 / 3 - $1 * ($2 - 1) / 3 )); }    # ส่วนที่ $2 (1..3) ของ $1 รวม 3 ส่วนได้ $1 พอดี
+share() { echo $(( $1 * $2 / 3 - $1 * ($2 - 1) / 3 )); }
 pgset() { echo "pgset $1: $2"; echo "$2" > /proc/net/pktgen/$1; }
 show() { echo "# $*"; "$@"; }
 
-# --- pktgen: ตั้งผ่าน /proc/net/pktgen  ทุกบรรทัดที่ตั้งถูกพิมพ์ลงผลด้วย ---
-
-# pktgen dst_mac=.. dst=.. [dst_count=N] size=.. pps=.. seconds=.. [ports=..] [dsts="ip ip ip"]
-#   ไม่ตั้ง flag RND: src IP, src port และ dst ไล่ทีละหนึ่งพร้อมกันทุก packet  tuple วนที่ lcm(125, ports, dst_count)
-#   thread t ใช้ source คนละช่วง (FLOW_SRC_BASE + 125t)  dsts = thread t ยิงไป ip ตัวที่ t+1 (ข้อ 3.0)
 pktgen() {
     local dst_mac dst dst_count=1 size pps seconds ports=$EST_PORTS dsts
     local "$@"
@@ -238,7 +109,7 @@ pktgen() {
         pgset $device "udp_dst_min $VPORT"
         pgset $device "udp_dst_max $VPORT"
         pgset $device "udp_src_min 1024"
-        pgset $device "udp_src_max $(( 1024 + ports ))"         # max ไม่นับ: port 1024 .. 1024+ports-1
+        pgset $device "udp_src_max $(( 1024 + ports ))"
         pgset $device "queue_map_min $thread"
         pgset $device "queue_map_max $thread"
     done
@@ -254,16 +125,10 @@ pktgen() {
          "tuples=$(( threads * $(lcm $(lcm $SRC_PER_THREAD $ports) $dst_count) ))"
 }
 
-# --- hping3 และ tcpreplay: fragment และ DF  (pktgen ตั้ง DF และแบ่ง fragment ไม่ได้) ---
-
-# hping <kind> <datagram/s> <วินาที> <arg ของ hping3...>
-#   hping3 ไม่มี duration จึงหยุดด้วย SIGINT แล้วอ่านจำนวนที่ส่งจากสรุปท้าย ("packets tramitted")
-#   hping3 คืนค่า 1 เมื่อไม่มีตอบกลับ (UDP ถูกทิ้งที่ backend) จึงไม่ใช้ exit code
 hping() {
     local kind=$1 rate=$2 seconds=$3 start output sent
     shift 3
     start=$(date +%s%N)
-    # -k 5: hping3 ที่พักสั้นมากบางครั้งไม่หยุดเมื่อได้ SIGINT  kill ตามไปไม่ให้ยิงค้าง
     output=$(show timeout -s INT -k 5 $seconds hping3 -q -i u$(( 1000000 / rate )) "$@" 2>&1) || true
     echo "$output"
     sent=$(awk '/packets tra[a-z]*itted/ {print $1}' <<< "$output")
@@ -272,25 +137,22 @@ hping() {
          "achieved_pps=$(( sent * 1000000000 / ($(date +%s%N) - start) ))"
 }
 
-# replay <kind> <datagram/s> <วินาที> <pcap> <packet ต่อ datagram>
 replay() {
     local kind=$1 rate=$2 output
-    output=$(show tcpreplay -i $CLIENT_IFACE --pps=$(( rate * $5 )) --duration=$3 --loop=0 $4 2>&1) || true
+    output=$(show tcpreplay -i $CLIENT_IFACE -K --pps=$(( rate * $5 )) --duration=$3 --loop=0 $4 2>&1) || true
     echo "$output"
     grep -q '^Actual: [0-9]* packets' <<< "$output" || return 1
     awk -v kind=$kind -v rate=$rate -v per=$5 '/^Actual: [0-9]+ packets/ {
-        printf "traffic: tool=tcpreplay kind=%s sent=%d target_pps=%d achieved_pps=%d\n",
-               kind, $2 / per, rate, $2 / per / $(NF - 1) }' <<< "$output"
+        printf "traffic: tool=tcpreplay kind=%s sent=%d packets=%d target_pps=%d achieved_pps=%d\n",
+               kind, $2 / per, $2, rate, $2 / per / $(NF - 1) }' <<< "$output"
 }
 
-# pcap ของ tcpreplay: frag = datagram 908 B ไป VPORT_FRAG แบ่ง 2 fragment (504 + 404)
-#                     df<ขนาด IP> = UDP ไป VPORT ตั้ง DF   ทุกแบบมี 8192 datagram (IP ID และ sport ต่างกัน)
 pcap_of() {
     local file=$RUN_DIR/$1.pcap
     [ -f $file ] || python3 - $file $1 $(cat /sys/class/net/$CLIENT_IFACE/address) $LB_MAC \
-        $CLIENT_IP $VIP $VPORT $VPORT_FRAG <<'PY'
+        $CLIENT_IP $VIP $VPORT <<'PY'
 import socket, struct, sys
-path, kind, src_mac, dst_mac, src, dst, vport, frag_port = sys.argv[1:]
+path, kind, src_mac, dst_mac, src, dst, vport = sys.argv[1:]
 ethernet = bytes.fromhex(dst_mac.replace(":", "") + src_mac.replace(":", "")) + b"\x08\x00"
 
 def packet(ident, flags_offset, payload):
@@ -302,13 +164,9 @@ def packet(ident, flags_offset, payload):
 
 packets = []
 for ident in range(8192):
-    if kind == "frag":
-        datagram = struct.pack("!HHHH", 1024 + ident, int(frag_port), 908, 0) + bytes(900)
-        packets += [packet(ident, 0x2000, datagram[:504]), packet(ident, 504 // 8, datagram[504:])]
-    else:
-        size = int(kind[2:])
-        packets.append(packet(ident, 0x4000, struct.pack("!HHHH", 1024 + ident, int(vport), size - 20, 0)
-                              + bytes(size - 28)))
+    size = int(kind[2:])
+    packets.append(packet(ident, 0x4000, struct.pack("!HHHH", 1024 + ident, int(vport), size - 20, 0)
+                          + bytes(size - 28)))
 with open(path, "wb") as out:
     out.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
     for data in packets:
@@ -317,20 +175,44 @@ PY
     echo $file
 }
 
-# raw <frag|df1470|df1490> <datagram/s> <วินาที>  ด้วย RAW_TOOL
 raw() {
     if [ $RAW_TOOL = tcpreplay ]; then
-        replay $1 $2 $3 $(pcap_of $1) $([ $1 = frag ] && echo 2 || echo 1)
-    elif [ $1 = frag ]; then
-        hping frag $2 $3 --udp -p $VPORT_FRAG -d 900 -m 504 $VIP
+        replay $1 $2 $3 $(pcap_of $1) 1
     else
         hping $1 $2 $3 --udp -p $VPORT -y -d $(( ${1#df} - 28 )) $VIP
     fi
 }
 
-# --- HTTP และ TCP stream ---
+frag_pcap() {
+    local file=$RUN_DIR/frag$1.pcap
+    [ -f $file ] || python3 - $file $1 $(cat /sys/class/net/$CLIENT_IFACE/address) $LB_MAC \
+        $CLIENT_IP $VIP $VPORT_FRAG <<'PY'
+import socket, struct, sys
+path, count, src_mac, dst_mac, src, dst, port = sys.argv[1:]
+count, piece = int(count), 56
+ethernet = bytes.fromhex(dst_mac.replace(":", "") + src_mac.replace(":", "")) + b"\x08\x00"
 
-# web-mix ของ wrk2: 100 path  1 KB 70, 10 KB 20, 100 KB 9, 1 MB 1  สลับลำดับคงที่ (seed 1)
+def packet(ident, flags_offset, payload):
+    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), ident, flags_offset, 64, 17, 0,
+                         socket.inet_aton(src), socket.inet_aton(dst))
+    total = sum(struct.unpack("!10H", header))
+    checksum = ~((total & 0xffff) + (total >> 16)) & 0xffff
+    return ethernet + header[:10] + struct.pack("!H", checksum) + header[12:] + payload
+
+with open(path, "wb") as out:
+    out.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+    for ident in range(16384):
+        datagram = struct.pack("!HHHH", 1024 + ident % 1000, int(port), piece * count, 0) + bytes(piece * count - 8)
+        for i in range(count):
+            more = 0x2000 if i < count - 1 else 0
+            data = packet(ident, more | i * piece // 8, datagram[i * piece:(i + 1) * piece])
+            out.write(struct.pack("<IIII", 0, 0, len(data), len(data)) + data)
+PY
+    echo $file
+}
+
+frag() { replay frag $(( $2 / $1 )) $3 $(frag_pcap $1) $1; }
+
 mix_lua() {
     local file=$RUN_DIR/mix.lua
     [ -f $file ] || cat > $file <<'LUA'
@@ -352,7 +234,6 @@ LUA
     echo $file
 }
 
-# web-mix ของ h2load: รายการ URI 100 บรรทัด สัดส่วนเดียวกัน
 uri_file() {
     local file=$RUN_DIR/uris-$1.txt entry n
     if [ ! -f $file ]; then
@@ -363,10 +244,6 @@ uri_file() {
     echo $file
 }
 
-# HTTP มาตรฐาน: http <host> <ไฟล์> <req/s รวม | sat> <connection> [close]
-#   wrk2 -R = อัตรารวมทุก connection (open-loop, latency แก้ coordinated omission แล้ว)  sat = -R สูงมาก
-#   ไม่มี wrk2: h2load --rps (ต่อ client) และ --log-file ให้ report.py คำนวณ percentile เอง
-#   close = "Connection: close" ทุก request  ทั้งสองตัวต่อ connection ใหม่เองเมื่อ server ปิด
 http() {
     local host=$1 file=$2 rate=$3 conns=$4 close=${5:+-H Connection:close}
     local threads=$(( conns < HTTP_THREADS ? conns : HTTP_THREADS )) url=http://$1:$VPORT/f${2/mix/1k}
@@ -385,7 +262,6 @@ web_file() { local file=${1#web-}; echo ${file%-close}; }
 close_of() { if [[ $1 == *-close ]]; then echo close; fi; }
 web_loads() { local file; for file in ${1:-$WEB_FILES}; do echo web-$file; done; }
 
-# workload ไปที่ VIP: via_vip <workload> <req/s | sat>
 via_vip() {
     if [ $1 = elephant ]; then
         show iperf -c $VIP -p $IPERF_PORT -P $STREAMS -t $HTTP_DURATION -f m
@@ -394,10 +270,11 @@ via_vip() {
     fi
 }
 
-# ยิงตรงไป backend 3 ตัวพร้อมกัน ชุดละ backend (ข้อ 0, 1.4)  แบ่ง connection/stream/rate ให้รวมเท่ากับชุดเดียว
-#   direct3 <workload> <req/s รวม | sat>   ผลของแต่ละชุดขึ้นต้นด้วย "## backend i"
+part_of() { if [ -n "$weighted" ]; then echo $(( $1 * weights[$2 - 1] / sum )); else share $1 $2; fi; }
+
 direct3() {
-    local load=$1 rate=$2 i part pids=() failed=0 HTTP_THREADS=$(( (HTTP_THREADS + 2) / 3 ))
+    local load=$1 rate=$2 weights=(${3:-1 1 1}) weighted=${3:-} i part pids=() failed=0 HTTP_THREADS=$(( (HTTP_THREADS + 2) / 3 ))
+    local sum=$(( weights[0] + weights[1] + weights[2] ))
     for i in $BACKENDS; do
         part=.b$i
         {
@@ -405,8 +282,8 @@ direct3() {
             if [ $load = elephant ]; then
                 show iperf -c $(backend_ip $i) -p $IPERF_PORT -P $(share $STREAMS $i) -t $HTTP_DURATION -f m
             else
-                http $(backend_ip $i) $(web_file $load) $(if [ $rate = sat ]; then echo sat; else share $rate $i; fi) \
-                    $(share $CONNS $i) $(close_of $load)
+                http $(backend_ip $i) $(web_file $load) $(if [ $rate = sat ]; then echo sat; else part_of $rate $i; fi) \
+                    $(part_of $CONNS $i) $(close_of $load)
             fi
         } > "$out.part$i" 2>&1 &
         pids+=($!)
@@ -417,7 +294,6 @@ direct3() {
     return $failed
 }
 
-# ข้อ 2: bpftrace บน B จับเวลาหา rule เฉพาะช่วงยิง  ผลลง <id>.lookup
 traced() {
     local status=0
     on_b lookup start || return 1
@@ -426,7 +302,6 @@ traced() {
     return $status
 }
 
-# ข้อ 4.4: sampler บน C ทุก 1 วินาที (<id>.ts) และเปลี่ยน quota ที่ 1/3 ของรอบ  เวลาเปลี่ยนจริงลง .meta
 dynamic() {
     local sampler changer status=0
     on_c sample $HTTP_DURATION > "$out.ts" &
@@ -438,8 +313,6 @@ dynamic() {
     return $status
 }
 
-# --- การวัดหนึ่งรอบ ---
-
 snapshot_all() {
     local a b
     host_snapshot $CLIENT_IFACE > "$1.a$2" &
@@ -450,7 +323,6 @@ snapshot_all() {
     wait $a $b
 }
 
-# mpstat ของ A B C พร้อมกัน: start หลังตัวนับก่อนยิง  stop ก่อนตัวนับหลังยิง เก็บเป็น <out>.cpu-{a,b,c}.json.gz
 cpu_all() {
     local a b
     if [ $1 = start ]; then
@@ -469,17 +341,17 @@ cpu_all() {
     fi
 }
 
-# อัตราที่ยิงได้จริงต่ำกว่า 95% ของเป้า -> invalid=rate  (flood ของ 3.5 ยิงเท่าที่ได้ ไม่ตรวจ)
 check_rate() {
     awk '/^traffic:/ { for (f = 2; f <= NF; f++) { split($f, kv, "="); v[kv[1]] = kv[2] }
-                       if (v["kind"] != "flood" && v["achieved_pps"] + 0 < 0.95 * v["target_pps"]) bad = 1 }
+                       if (v["achieved_pps"] + 0 < 0.95 * v["target_pps"]) bad = 1 }
          END { if (bad) print "invalid=rate" }' "$1.client" >> "$1.meta"
 }
 
-# รอบที่เสร็จแล้ว: มี t_end_ns และไม่มี traffic_error / invalid
-round_done() { [ -f "$1.meta" ] && grep -q '^t_end_ns=' "$1.meta" && ! grep -q '^traffic_error=\|^invalid=' "$1.meta"; }
+round_done() {
+    [ -f "$1.meta" ] && grep -q '^t_end_ns=' "$1.meta" && ! grep -q '^traffic_error=' "$1.meta" &&
+        { ! grep -q '^invalid=' "$1.meta" || grep -q '^link_bound=1$' "$1.meta"; }
+}
 
-# โหมด plan: นับรอบและเวลา (วินาทีที่ยิง + เวลาเสียต่อรอบ)  รอบที่เสร็จแล้วไม่นับใน "ยังไม่เสร็จ"
 plan_count() {
     local out=$1 seconds=$2
     PLAN_ROUNDS=$(( PLAN_ROUNDS + 1 )) PLAN_MS=$(( PLAN_MS + seconds * 1000 + OVERHEAD_MS ))
@@ -488,10 +360,6 @@ plan_count() {
     fi
 }
 
-# --- ขั้นของหนึ่งรอบ: ไฟล์ข้อย่อยเรียกตามลำดับ  ไฟล์ผล <id>-r<rep>.*  ($rep มาจากลูปของข้อย่อย) ---
-
-# round_begin <id> <วินาทีที่ยิง> "<key=value ...>"  ตั้ง id และ out ของรอบ แล้วเขียน .meta
-#   คืน 1 = ไม่ต้องยิง: รอบซ้ำในการรันครั้งนี้ (control ของข้อ 5), โหมด plan (นับอย่างเดียว), RESUME และเสร็จแล้ว
 round_begin() {
     id=$1 out=$RUN_DIR/$1-r$rep
     if [ -n "${RAN[$out]:-}" ]; then return 1; fi
@@ -503,27 +371,20 @@ round_begin() {
     echo "  $id r$rep"
 }
 
-# reset B: โหลด mode เดิมใหม่ (map ว่าง) + feature/algo เดิม + ล้าง conntrack/ipvs  ค่าที่ตั้งจริงลง .meta  แล้วรอ SETTLE
-#   RESET_ARGS เช่น "algo awfd 4 500" = บันทึก algo ใหม่ก่อน daemon จึงเริ่มครั้งเดียวตอน reset
-#   B_OFF_PATH=1: B ไม่อยู่ในเส้นทาง (0.x, 3.0, direct ของ 1.4) ไม่แตะ B เลย  ไม่สลับ XDP การ์ดของ B จึงไม่ reset
 reset_b() {
     if [ -n "${B_OFF_PATH:-}" ]; then echo "b_mode=none" >> "$out.meta"; else on_b reset ${RESET_ARGS:-} >> "$out.meta"; fi
     sleep $SETTLE
 }
 
-# ตัวนับของ A B C พร้อมกัน (NIC, ต่อคิว, bpf_stats, xdp_lb_ctl stats, backend)  0 = ก่อนยิง 1 = หลังยิง  report.py อ่าน
 read_counters() { snapshot_all "$out" $1; }
 
-# mpstat -P ALL 1 บน A B C  เริ่มหลังตัวนับก่อนยิง หยุดก่อนตัวนับหลังยิง  -> <id>.cpu-{a,b,c}.json.gz
 cpu_begin() { cpu_all start; }
 cpu_end() { cpu_all stop "$out"; }
 
-# บรรทัดสรุปที่เครื่องมือพิมพ์เองตอนจบ (แสดงบนจอ)  ผลเต็มอยู่ใน <id>.client
 TRAFFIC_SUMMARY='^# (wrk2|h2load|iperf|timeout|tcpreplay) |^## backend|^Result:|pps .*errors|packets tra[a-z]*itted|'
 TRAFFIC_SUMMARY+='requests in|^Requests/sec|^Transfer/sec|Socket errors|Non-2xx|^ +(50|90|99)\.000%|^ +99\.900%|'
 TRAFFIC_SUMMARY+='\[SUM\]|^Actual:|^finished in|^requests:|^time for request:|^traffic:'
 
-# traffic <คำสั่ง...>: ยิงแล้วเก็บผลลง <id>.client  เวลาเริ่ม/จบ และ gap_ms (เวลาเสียตั้งแต่จบรอบก่อน) ลง .meta
 traffic() {
     local start
     echo "  A\$ $*"
@@ -537,15 +398,12 @@ traffic() {
     grep -E "$TRAFFIC_SUMMARY" "$out.client" | sed 's/^/     /' || true
 }
 
-# ตรวจ rate (ต่ำกว่า 95% ของเป้า = invalid=rate ไม่เอาไปเฉลี่ย) และบีบไฟล์ latency ของ h2load
 round_end() {
     check_rate "$out"
     if compgen -G "$out.lat*" >/dev/null; then gzip -f "$out".lat*; fi
     if grep -q '^traffic_error=\|^invalid=' "$out.meta"; then echo "     $(grep '^traffic_error=\|^invalid=' "$out.meta" | tr '\n' ' ')"; fi
 }
 
-# show_cpu <a|b|c>: core เฉลี่ยรายวินาทีจาก mpstat ของรอบนี้ (100 − %idle − %iowait  สูตรเดียวกับ report.py)
-#   มีรอบ idle ของ mode นี้ใน rep เดียวกัน (IDLE_OUT จาก idle_round) ก็แสดงคู่กัน
 show_cpu() {
     local idle=""
     if [ -n "${IDLE_OUT:-}" ] && [ "$IDLE_OUT" != "$out" ]; then idle="idle $(mpstat_cores "$IDLE_OUT.cpu-$1.json.gz") core   "; fi
@@ -564,8 +422,6 @@ except Exception:
 PY
 }
 
-# รอบ idle: CPU ตอนไม่มี traffic ของ mode นี้ นาน IDLE_DURATION  report หักออกจากรอบอื่นของข้อและ mode เดียวกัน
-#   idle_round <id ของ mode> "<key=value ...>"
 idle_round() {
     IDLE_OUT=$RUN_DIR/$1-idle-r$rep
     round_begin $1-idle $IDLE_DURATION "kind=idle $2" || return 0
@@ -579,23 +435,178 @@ idle_round() {
     show_cpu b
 }
 
-# --- คำสั่งอ่านค่าที่ใช้หลายข้อ (ส่งให้ cmd  ตัวแปรในคำสั่งถูกแทนบนเครื่องปลายทาง) ---
-B_NIC='cat /sys/class/net/$LB_IFACE/statistics'      # ต่อท้ายด้วย /rx_packets /tx_packets /rx_bytes /rx_missed_errors
+B_NIC='cat /sys/class/net/$LB_IFACE/statistics'
 C_NIC='cat /sys/class/net/$SERVER_IFACE/statistics'
-B_STATS='$REPO/xdp_lb_ctl stats'                     # ตัวนับของ xdp_lb (xdp_redirect conn_new frag_hit ...)
-B_PROG='bpftool prog show pinned $PIN/prog'          # run_cnt และ run_time_ns ของ prog (ต้องเปิด bpf_stats)
-# UDP ที่ backend ทั้ง 3 ตัวรับ (port VPORT) และ datagram fragment จาก A ที่ประกอบแล้ว (port VPORT_FRAG)
+B_STATS='$REPO/xdp_lb_ctl stats'
+B_PROG='bpftool prog show pinned $PIN/prog'
 C_UDP_IN='for i in 1 2 3; do ip netns exec server_$i nft list counter inet perf_sink udp_in; done | awk "\$1 == \"packets\" {s += \$2} END {print s}"'
 C_UDP_FRAG_IN='for i in 1 2 3; do ip netns exec server_$i nft list counter inet perf_sink udp_frag_in; done | awk "\$1 == \"packets\" {s += \$2} END {print s}"'
-# request ที่ nginx ของ backend แต่ละตัวตอบแล้ว (stub_status)  ผล "b1 <n>" "b2 <n>" "b3 <n>"
 C_REQUESTS='for i in 1 2 3; do echo b$i $(ip netns exec server_$i curl -s --max-time 1 http://$(backend_ip $i):$VPORT/nginx_status | awk "NR == 3 {print \$3}"); done'
 
 flow_meta() { echo "profile=$1 ports=$2 threads=${3:-$PKTGEN_THREADS} src_per_thread=$SRC_PER_THREAD duration=$DURATION"; }
 http_meta() { echo "http_tool=$HTTP_TOOL conns=$CONNS http_threads=$HTTP_THREADS keepalive_reqs=$KEEPALIVE_REQS http_duration=$HTTP_DURATION"; }
 ports_of() { if [ $1 = new ]; then echo $NEW_PORTS; else echo $EST_PORTS; fi; }
+forwarded() {
+    if [ $1 = xdp ]; then cmd b "$B_STATS" | field xdp_redirect; else cmd b "$B_NIC/tx_packets"; fi
+}
+sent_of() { sed -n 's/^traffic:.* sent=\([0-9]*\) .*/\1/p' "$out.client"; }
+delta_requests() {
+    local i
+    for i in 1 2 3; do delta_field "C backend $i requests" b$i "$1" "$2"; done
+}
 
-# --- C0 จากข้อ 0: c0.tsv ใน RUN_DIR และใน results/<CAMPAIGN>/0.x/ (scenario workload C0 link_bound b1_thr b2_thr b3_thr) ---
-#   report.py สร้างใหม่เมื่อมีผลข้อ 0 ที่ใหม่กว่าไฟล์  ทุกฟังก์ชันอ่านจากไฟล์นี้ ไม่ parse ผลของข้อ 0 ซ้ำ
+read -r -d '' PERF_START_B <<'EOF' || true
+setsid perf stat -a -A -e cycles,ref-cycles -I 1000 -x, -o /run/perf-b.csv < /dev/null > /dev/null 2>&1 &
+echo $! > /run/perf-b.pid
+EOF
+PERF_STOP_B='pid=$(cat /run/perf-b.pid); kill -INT $pid; while kill -0 $pid 2>/dev/null; do sleep 0.1; done; cat /run/perf-b.csv'
+
+perf_prereq() {
+    ! curl -s -m 2 -o /dev/null http://$LB_IP:9100/metrics ||
+        { echo "node_exporter บน B ยังทำงาน  สั่ง /opt/monitor/monitor.sh stop บน A ก่อน"; exit 1; }
+    TSC_MHZ=$(remote b "turbostat --quiet --show TSC_MHz --interval 1 --num_iterations 1 2>/dev/null" | awk 'NR == 2 {print $1}')
+    [[ "$TSC_MHZ" =~ ^[0-9]+$ ]] || { echo "อ่าน TSC ของ B ไม่ได้ (turbostat)"; exit 1; }
+}
+perf_start_check() {
+    if [ -n "$PLAN" ]; then return; fi
+    perf_prereq
+    trap 'remote b "kill -INT \$(cat /run/perf-b.pid 2>/dev/null) 2>/dev/null; true"' EXIT
+}
+
+perf_begin() { remote b "$PERF_START_B"; }
+
+perf_end() {
+    remote b "$PERF_STOP_B" > "$out.perf.csv"
+    awk -F, -v tsc=$TSC_MHZ '
+        $5 == "cycles" { cycles += $3 }
+        $5 == "ref-cycles" {
+            if ($1 != t) { t = $1; dt[++k] = $1 - last; last = $1 }
+            ref[k, $2] += $3; cpus[$2] = 1; busy_s += $3 / (tsc * 1e6)
+        }
+        END {
+            for (i = 2; i < k; i++) {
+                c = 0
+                for (cpu in cpus) { c += ref[i, cpu]; mid[cpu] += ref[i, cpu]; span += cpu == "CPU0" ? dt[i] : 0 }
+                c /= dt[i] * tsc * 1e6; sum += c
+                if (i == 2 || c < lo) lo = c
+                if (i == 2 || c > hi) hi = c
+            }
+            m = k > 2 ? k - 2 : 1
+            for (cpu in cpus) if (mid[cpu] > hot) hot = mid[cpu]
+            printf "b_cpu_cores=%.3f\nb_cpu_cores_min=%.3f\nb_cpu_cores_max=%.3f\nb_cpu_hot_pct=%.1f\n",
+                   sum / m, lo, hi, (span > 0 ? hot / (span * tsc * 1e6) * 100 : 0)
+            printf "b_cpu_busy_s=%.3f\nb_cpu_cycles=%.0f\nb_perf_seconds=%d\nb_tsc_mhz=%s\n", busy_s, cycles, k, tsc
+        }' "$out.perf.csv" | tee -a "$out.meta" | sed 's/^/  /'
+}
+
+per_unit() {
+    awk -F= -v unit="$1" -v n=$2 '$1 == "b_cpu_cycles" {c = $2} $1 == "b_cpu_busy_s" {s = $2}
+        END {if (n > 0) printf "  CPU ของ B ต่อ %-17s %.0f cycles  %.0f ns\n", unit, c / n, s * 1e9 / n}' "$out.meta"
+}
+
+idle_perf() {
+    round_begin $1-idle $IDLE_DURATION "kind=idle $2" || return 0
+    reset_b
+    read_counters 0
+    cpu_begin
+    perf_begin
+    traffic sleep $IDLE_DURATION
+    perf_end
+    cpu_end
+    read_counters 1
+    round_end
+}
+
+read -r -d '' ONE_CORE_B <<'EOF' || true
+irqs=$(awk -v d=$LB_IFACE '$0 ~ d {sub(":", "", $1); print $1}' /proc/interrupts)
+for irq in $irqs; do echo 0 > /proc/irq/$irq/smp_affinity_list; done
+if [ -f /run/perf-lb-nginx.pid ]; then
+    master=$(cat /run/perf-lb-nginx.pid)
+    sed -i 's/worker_processes auto;/worker_processes 1; worker_cpu_affinity 1;/' /etc/nginx/perf-lb.conf
+    kill $master
+    while kill -0 $master 2>/dev/null; do sleep 0.1; done
+    taskset -c 0 nginx -c /etc/nginx/perf-lb.conf < /dev/null >> /var/log/perf-lb-nginx.err 2>&1
+    sleep 0.5
+    echo "b_nginx_worker_cpus=$(ps -o psr= --ppid $(cat /run/perf-lb-nginx.pid) | tr -d ' ' | sort -u | paste -sd, -)"
+fi
+echo "b_irq_cpus=$(for irq in $irqs; do cat /proc/irq/$irq/smp_affinity_list; done | sort -u | paste -sd, -)"
+echo "b_rps_cpus=$(cat /sys/class/net/$LB_IFACE/queues/rx-*/rps_cpus | sort -u | paste -sd, -)"
+EOF
+
+read -r -d '' END_B <<'EOF' || true
+kill -INT $(cat /run/perf16.pid 2>/dev/null) 2>/dev/null
+core=0
+for irq in $(awk -v d=$LB_IFACE '$0 ~ d {sub(":", "", $1); print $1}' /proc/interrupts); do
+    echo $((core % QUEUES)) > /proc/irq/$irq/smp_affinity_list
+    core=$((core + 1))
+done
+EOF
+
+reset_one_core() {
+    local pinned
+    reset_b
+    pinned=$(remote b "$ONE_CORE_B")
+    echo "$pinned" >> "$out.meta"
+    echo "  B 1 core: $(tr '\n' ' ' <<< "$pinned")"
+    grep -q '^b_irq_cpus=0$' <<< "$pinned" && grep -Eq '^b_rps_cpus=[0,]+$' <<< "$pinned" &&
+        { ! grep -q '^b_nginx' <<< "$pinned" || grep -q '^b_nginx_worker_cpus=0$' <<< "$pinned"; } ||
+        { echo "B ไม่ได้ใช้ core 0 core เดียว  หยุด"; exit 1; }
+}
+
+read -r -d '' CORE0_START_B <<'EOF' || true
+taskset -apc 1-3,5-7 $(pgrep -x mpstat) > /dev/null
+setsid taskset -c 3 perf stat -C 0,4 -A -e cycles,ref-cycles -I 1000 -x, -o /run/perf16.csv < /dev/null > /dev/null 2>&1 &
+echo $! > /run/perf16.pid
+EOF
+CORE0_STOP_B='pid=$(cat /run/perf16.pid); kill -INT $pid; while kill -0 $pid 2>/dev/null; do sleep 0.1; done; cat /run/perf16.csv'
+
+core0_begin() { remote b "$CORE0_START_B"; }
+
+core0_end() {
+    remote b "$CORE0_STOP_B" > "$out.perf.csv"
+    awk -F, -v tsc=$TSC_MHZ '
+        $5 == "cycles" && $2 == "CPU0" { cycles += $3 }
+        $5 == "ref-cycles" {
+            dt = $1 - last[$2]; last[$2] = $1
+            busy_s[$2] += $3 / (tsc * 1e6)
+            pct[$2, ++n[$2]] = $3 / (dt * tsc * 1e6) * 100
+        }
+        END {
+            for (i = 2; i < n["CPU0"]; i++) {
+                p = pct["CPU0", i]; sum += p; sum4 += pct["CPU4", i]
+                if (i == 2 || p < lo) lo = p
+                if (i == 2 || p > hi) hi = p
+            }
+            m = n["CPU0"] > 2 ? n["CPU0"] - 2 : 1
+            printf "b_cpu0_busy_pct=%.1f\nb_cpu0_busy_min=%.1f\nb_cpu0_busy_max=%.1f\nb_cpu4_busy_pct=%.1f\n", sum / m, lo, hi, sum4 / m
+            printf "b_cpu0_busy_s=%.3f\nb_cpu0_cycles=%.0f\nb_perf_seconds=%d\nb_tsc_mhz=%s\n", busy_s["CPU0"], cycles, n["CPU0"], tsc
+        }' "$out.perf.csv" | tee -a "$out.meta" | sed 's/^/  /'
+}
+
+per_unit0() {
+    awk -F= -v unit="$1" -v n=$2 '$1 == "b_cpu0_cycles" {c = $2} $1 == "b_cpu0_busy_s" {s = $2}
+        END {if (n > 0) printf "  CPU 0 ต่อ %-20s %.0f cycles  %.0f ns\n", unit, c / n, s * 1e9 / n}' "$out.meta"
+}
+
+one_core_start() {
+    if [ -n "$PLAN" ]; then return; fi
+    perf_prereq
+    trap 'remote b "$END_B"' EXIT
+}
+
+idle_one_core() {
+    round_begin $1-idle $IDLE_DURATION "kind=idle $2" || return 0
+    reset_one_core
+    read_counters 0
+    cpu_begin
+    core0_begin
+    traffic sleep $IDLE_DURATION
+    core0_end
+    cpu_end
+    read_counters 1
+    round_end
+}
+
 c0_files() {
     local dir
     for dir in "$RUN_DIR" "$RESULTS"/0.*; do
@@ -619,7 +630,6 @@ need_c0() {
         fi
     done
 }
-# levels <scenario> <workload> "<ระดับ ...>" -> <ระดับ>:<req/s>  ระดับเป็น % ของ C0 (open-loop)
 levels() {
     local cap level
     cap=$(c0 $1 $2)
@@ -629,7 +639,6 @@ level_meta() { echo "level=${3%:*} rate=${3#*:} c0_scenario=$1 c0=$(c0 $1 $2) $(
 
 use_mode() { on_b mode $1 ${2:-} >/dev/null; on_c mode $(c_mode_for $1); }
 
-# B_REST_MODE=none ระหว่างช่วง B ของชุดใหม่: ไม่ใส่ XDP คืนตอนจบข้อ (ใส่/ถอด XDP ทำให้การ์ดของ B reset)
 restore() {
     on_c mode guarded
     on_c quota ${QUOTA[equal]} >/dev/null
@@ -637,20 +646,31 @@ restore() {
     on_b mode ${B_REST_MODE:-xdp} >/dev/null
 }
 
-# --- ข้อ 4 และ 5 ---
+check_test4() {
+    need_c0 $1 web-1k
+    if [ -z "$PLAN" ] && [ "$(c0_field $1 web-1k 4)" = 1 ]; then
+        echo "C0 ของ $1 ใช้สายเกิน 90% (link-bound)  ลด QUOTA ของข้อ 4 ก่อน"
+        exit 1
+    fi
+    check_variants
+}
 
-# ชุดอัลกอริทึมของข้อ 4 แปลงเป็นคำสั่ง algo ของ setup_b_lb.sh
-# algo ของ reset สำหรับ variant ข้อ 4  <variant> <scenario ของ quota ตอนเริ่มรอบ>
+test4_levels() {
+    levels $1 web-1k "$TEST4_LEVELS"
+    if [ $rep -le $TEST4_SAT_REPS ]; then echo sat:sat; fi
+}
+
 variant_algo() {
+    local m
     case $1 in
         xdp:wcmp)  echo wcmp 4 ;;
         xdp:lcf)   echo lcf 500 ;;
+        xdp:awfd*s) m=${1#xdp:awfd}; echo awfd ${m%s} 500 $TEST4_AWFD_TUNE ;;
         xdp:awfd*) echo awfd ${1#xdp:awfd} 500 ;;
         ipvs:wlc|nginx:least_conn|haproxy:leastconn) echo ${1#*:} ${QUOTA[$2]//%/} ;;
         *)         echo ${1#*:} ;;
     esac
 }
-# ข้อ 4: ไม่ผสม xdp กับ LB อื่นในการรันเดียว  รันของ LB อื่นจบแล้วไม่ใส่ XDP คืน (B_REST_MODE=none)
 check_variants() {
     local kinds
     kinds=$(for variant in $TEST4_VARIANTS; do [ ${variant%%:*} = xdp ] && echo xdp || echo other; done | sort -u)
@@ -658,10 +678,6 @@ check_variants() {
     [ "$kinds" = xdp ] || B_REST_MODE=${B_REST_MODE:-none}
 }
 
-
-# --- plan: นับรอบและเวลาโดยไม่ยิงจริง ---
-
-# เวลาเสียต่อรอบ: OVERHEAD ถ้าตั้งไว้, ไม่งั้นค่าเฉลี่ย gap_ms ใน RUN_DIR, ไม่มีก็ 5 s
 overhead() {
     read -r OVERHEAD_MS GAP_ROUNDS <<< "$(cat "$RUN_DIR"/*.meta 2>/dev/null |
         awk -F= '$1 == "gap_ms" {sum += $2; n++} END {if (n) printf "%d %d", sum / n, n}')"
@@ -670,8 +686,6 @@ overhead() {
 }
 hours() { awk -v ms=$1 'BEGIN {printf "%.2f", ms / 3600000}'; }
 
-# plan_of <ข้อ ...> -> หนึ่งบรรทัดต่อข้อ "ข้อ รอบ รอบที่ยังไม่เสร็จ ms ms_ที่ยังไม่เสร็จ"
-#   รันฟังก์ชันของข้อในโหมด PLAN ใน subshell เดียวกัน รอบที่ใช้ร่วมกัน (control ของข้อ 5) จึงนับครั้งเดียว
 plan_one() {
     local TEST=$1
     PLAN_ROUNDS=0 PLAN_LEFT=0 PLAN_MS=0 PLAN_LEFT_MS=0
@@ -682,7 +696,7 @@ plan_of() { ( PLAN=1; for id in "$@"; do plan_one $id; done ) }
 
 plan() {
     local id rounds left ms left_ms notes sum=(0 0 0 0)
-    local -A RAN=()                                     # นับทุกรอบ แม้รอบที่รันไปแล้วในการรันครั้งนี้
+    local -A RAN=()
     notes=$(mktemp)
     echo "แผนของ $RUN_DIR   เวลาเสียต่อรอบ $(awk -v ms=$OVERHEAD_MS 'BEGIN {printf "%.1f", ms / 1000}') s" \
          "($([ -n "$GAP_ROUNDS" ] && echo "ค่าเฉลี่ยจาก $GAP_ROUNDS รอบ" || echo "OVERHEAD หรือค่าเริ่มต้น"))"
@@ -696,7 +710,6 @@ plan() {
     rm -f "$notes"
 }
 
-# ตอนเริ่มแต่ละข้อ: จำนวนรอบและเวลาที่คาดว่าจะเสร็จ
 eta() {
     local rounds left ms left_ms
     overhead
@@ -705,9 +718,6 @@ eta() {
          "เสร็จราว $(date -d "+$(( ${left_ms:-0} / 1000 )) seconds" +%H:%M)"
 }
 
-# --- เริ่มและจบการรันของไฟล์ข้อย่อย ---
-
-# start_run "<คำสั่งที่รัน>": root, pktgen, MAC ของ B C, route ไป VIP, สภาพเครื่อง A B C ลง env-*.txt (preamble เดิม)
 start_run() {
     require_root
     modprobe pktgen
@@ -726,8 +736,7 @@ start_run() {
         declare -p DURATION HTTP_DURATION HTTP_DURATION_DYNAMIC IDLE_DURATION REPS_UDP REPS_TEST2 REPS_TEST3 REPS_HTTP \
             SETTLE PPS_LADDER SIZES SIZE_SWEEP_PPS STRESS_PPS PKTGEN_THREADS SRC_PER_THREAD EST_PORTS NEW_PORTS CONNS \
             HTTP_THREADS SAT_RATE STREAMS WEB_FILES TEST1_MODES TEST12_LEVELS LAT_RATE VIP_COUNTS TEST2_PPS TEST3_PPS \
-            FRAG_TOTAL_PPS FRAG_PERCENTS PMTU_PPS FLOOD_RATE FRAG_FLOW_RATE TEST4_VARIANTS TEST4_LEVELS \
-            TEST4_SAT_REPS QUOTA TEST4_SCENARIOS VIP_MTU
+            PMTU_PPS TEST4_VARIANTS TEST4_LEVELS TEST4_SAT_REPS QUOTA TEST4_SCENARIOS VIP_MTU
     } >> "$RUN_DIR/env-a.txt"
     { echo "=== $(date '+%F %T')"; on_b env; } >> "$RUN_DIR/env-b.txt"
     { echo "=== $(date '+%F %T')"; on_c env; } >> "$RUN_DIR/env-c.txt"
@@ -735,14 +744,13 @@ start_run() {
     SEQ=$(cat "$RUN_DIR"/*.meta 2>/dev/null | sed -n 's/^seq=//p' | sort -n | tail -1)
     SEQ=${SEQ:-0}
     overhead
-    {   # ค่าจริงของเครื่อง: interface อ่านจาก perf_env.sh ของเครื่องนั้น
+    {
         echo "== ค่าจริง  A $CLIENT_IFACE $CLIENT_IP  B $(remote b 'echo $LB_IFACE') $LB_IP $LB_MAC" \
              " C $(remote c 'echo $SERVER_IFACE') $SERVER_IP $SERVER_MAC"
         echo "   VIP $VIP  backend $(backend_ip 1) $(backend_ip 2) $(backend_ip 3)"
     } | tee -a "$RUN_DIR/env-a.txt"
 }
 
-# run_one <ข้อ> [plan | report [dir]]: บรรทัดสุดท้ายของไฟล์ข้อย่อย  ไม่ใส่อะไร = รันข้อนั้นแล้วสรุปด้วย report.py
 run_one() {
     TEST=$1
     RUN_DIR=${USER_RUN_DIR:-$RESULTS/$TEST}

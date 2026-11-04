@@ -213,9 +213,10 @@ backend_counters() {
         echo "b${i}_throttled_usec=$(awk '$1 == "throttled_usec" {print $2}' $cgroup/cpu.stat)"
         echo "b${i}_quota_pct=$(awk '{print $1 == "max" ? 0 : int($1 * 100 / $2)}' $cgroup/cpu.max)"
         echo "b${i}_rx_packets=$(cat /sys/class/net/vh$i/statistics/tx_packets)"
-        # request ที่ nginx ตอบแล้ว (stub_status บรรทัดที่ 3 ช่องที่ 3)  การอ่านนี้นับเพิ่ม 1 request
-        echo "b${i}_requests=$(ip netns exec server_$i curl -s --max-time 1 \
-            http://$(backend_ip $i):$VPORT/nginx_status | awk 'NR == 3 {print $3}')"
+        # stub_status บรรทัดที่ 3: connection ที่รับ (accepts = ที่ LB ส่งมา) และ request ที่ตอบแล้ว
+        #   การอ่านนี้นับเพิ่มอย่างละ 1
+        ip netns exec server_$i curl -s --max-time 1 http://$(backend_ip $i):$VPORT/nginx_status |
+            awk -v i=$i 'NR == 3 {print "b" i "_accepts=" $1; print "b" i "_requests=" $3}'
     done
 }
 

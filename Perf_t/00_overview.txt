@@ -18,7 +18,7 @@
          route ไป VIP และ 192.168.200.0/22 ล็อก MTU 1480; ssh ไป B/C ใช้ connection ค้าง (ControlMaster)
       B  NIC 4 คิว, IRQ ของคิว q อยู่ core q (0-3), RSS udp4/tcp4 = sdfn (IP + port)
          xdp_lb_awfd core 4, irqbalance หยุด, governor performance
-      C  NIC 4 คิว IRQ core 0-3, agent core 4, backend i อยู่ core 4+i (5 6 7) ตัวละ 1 core
+      C  NIC e1000e (บนเมนบอร์ด) มีคิวรับคิวเดียว ไม่มี RSS: IRQ เดียวอยู่ CPU 0, agent core 4, backend i อยู่ core 4+i (5 6 7) ตัวละ 1 core
          (CPUQuota 100% = 1 core เต็ม), nginx 1 worker + iperf -s ใน scope เดียวกัน
 
 2. เป้าหมายรายข้อ
@@ -29,9 +29,9 @@
   1.3  เทียบ CPU ของ B ต่อ Gbit/s ของ TCP stream ยาว
   1.4  วัด p50/p99 ที่เพิ่มขึ้นเมื่อผ่าน LB เทียบกับยิงตรง ที่ rate ต่ำคงที่
   2    วัดเวลาที่ใช้เลือก rule ต่อ packet (ns) เมื่อจำนวน VIP เพิ่ม ด้วย flow ใหม่ (ทุก packet ต้องหา rule)
-  3    แยกต้นทุนต่อ packet ของแต่ละขั้นของ xdp_lb และการส่งถึงของ fragment เมื่อ frag cache ถูกท่วม
+  3    แยกต้นทุนต่อ packet ของแต่ละขั้นของ xdp_lb, ต้นทุนและการส่งถึงของ fragment handling
   4    เทียบ latency, error, balance ของ LB และอัลกอริทึมตัวแทนของแต่ละ LB ที่ load เท่ากันเป็น % ของ C0
-       เมื่อ backend เป็นตัวจำกัด (ไม่ใช่สาย 1G)  backend เท่ากัน (4.1) / ไม่เท่ากัน (4.2 4.3) / เปลี่ยนกลางรอบ (4.4)
+       เมื่อ backend เป็นตัวจำกัด (ไม่ใช่สาย 1G)  backend เท่ากัน (4.1) / ไม่เท่ากัน (4.2 4.3 4.5) / เปลี่ยนกลางรอบ (4.4)  เทียบกับ baseline ไม่ผ่าน LB (4.0)
 
 3. ขอบเขตระบบ
 ------------------------------------------------------------------------
@@ -76,9 +76,16 @@
   p50 p99 p99.9   percentile ของ latency จาก histogram ของทุกชุดรวมกัน (ไม่แสดงในแถว sat)   ms    LB
   error_rate      (socket error + non-2xx) ÷ (request + error)                              %     LB
   frag_delivery   datagram ที่ backend ประกอบได้ (udp_frag_in) ÷ datagram ที่ส่ง           %     HB
+  cpu0_pct        % เวลาทำงานของ core 0 ของ B = ref-cycles ÷ (วินาที × TSC) เฉลี่ยรายวินาที  %     LB
+                  (perf stat ข้อ 1.6 3.2 3.3 ที่ B ใช้ core 0 core เดียว ไม่ขึ้นกับ turbo)
+  cpu_cores       core ของ B ที่ใช้รวมทุก CPU (perf stat ข้อ 3.5 และชุด 3.2/3.3-allcore)        core  LB
+                   cpu_hot_pct = % ของ CPU ที่ทำงานมากสุด
+  cpu_ns_per_pkt  เวลาทำงานของ CPU รวม ÷ packet ที่มาถึง B   cpu_ns_per_datagram ÷ datagram   ns    LB
   icmp_ratio      icmp_sent ÷ packet ที่ส่ง  (1490 B ≈ 1, 1470 B = 0)                      -     NB
   b<i>_util       CPU ของ backend i ÷ quota                                               -     NB
   b<i>_req_pct    request ที่ backend i ตอบ ÷ รวม (nginx stub_status)                     %     NB ∝ quota
+  b<i>_conn_pct   connection ที่ backend i รับ (accepts) ÷ รวม = การตัดสินใจของ LB ตอนเปิด connection  %  NB ∝ quota
+                  (stub_status เดียวกัน  เริ่มเก็บ 2026-11-02 ชุดก่อนหน้าไม่มี)
   b<i>_throttled_pct  เวลาที่ backend i ถูกหยุดเพราะใช้ CPU เกิน quota ÷ เวลา (cgroup cpu.stat) %  LB
   balance         util สูงสุด ÷ util เฉลี่ย (1 = แบ่งตาม capacity พอดี)                    -     LB
   C0              ผลรวม throughput ของ 3 backend ที่ยิงตรงพร้อมกันแบบ sat (เก็บใน c0.tsv)    req/s HB
@@ -95,18 +102,18 @@
   ระบบ      kernel, driver, offload, คิว 4, ring, RSS sdfn, MTU (เก็บใน env-a/b/c.txt ทุกครั้งที่รัน)
             IRQ/core ตามหัวข้อ 1, route MTU 1480 บน A, conntrack max 1,048,576 (nft/ipt)
             conn_map LRU 65,536 ไม่มี timeout, frag_cache_map LRU 65,536 timeout 30 s, vip_map/awfd_map 1,024
-            quota (หัวข้อ 7), bpf_stats เปิดเฉพาะข้อ 2 และ 3, fragment/pmtu ของ xdp ปิดยกเว้นข้อ 3.2-3.5
+            quota (หัวข้อ 7), bpf_stats เปิดเฉพาะข้อ 2 3.0 3.1 3.4, fragment/pmtu ของ xdp ปิดยกเว้นข้อ 3.2-3.5
             nginx backend 1 worker keepalive_requests 100 (KEEPALIVE_REQS) ให้มี connection ใหม่ตลอดรอบ
-  workload  ขนาด frame, pps, flow profile, fragment %, ขนาด DF, connection, stream, ไฟล์ HTTP, rate, เวลา
+  workload  ขนาด frame, pps, flow profile, จำนวน fragment ต่อ datagram, ขนาด DF, connection, stream, ไฟล์ HTTP, rate, เวลา
 
 7. matrix กลาง (ค่าเริ่มต้นใน run_tests.sh  ปรับผ่าน env ได้)
 ------------------------------------------------------------------------
-  PPS_LADDER      50k 100k 250k 500k 1M pps ที่ 64 B (ขาออกหลังห่อ IPIP ~1.20 Mpps จึงไม่ติด link)
+  PPS_LADDER      50k 100k 250k 500k 750k 1M pps ที่ 64 B (ขาออกหลังห่อ IPIP ~1.20 Mpps จึงไม่ติด link)
   SIZE_SWEEP_PPS  50k pps สำหรับ 64/512/1024/1400 B    STRESS_PPS ปิดไว้ (เช่น 1200000 ติดป้าย link_bound)
   flow profile    src 10.200.0.1 + 125t .. +124 ต่อ pktgen thread t (2 thread), sport จาก 1024 ไล่ลำดับไม่สุ่ม
                   EST = 125 IP × 4 port × 2 thread = 1,000 tuple
                   NEW = 125 × 64,511 port (coprime) × 2 = 16.1M tuple ≥ 500k × 20 s  ไม่วนซ้ำในรอบ
-  เวลา            DURATION 20 s (UDP), HTTP_DURATION 40 s, HTTP_DURATION_DYNAMIC 60 s (4.4),
+  เวลา            DURATION 20 s (UDP), HTTP_DURATION 40 s (ข้อ 1 ทั้งหมด 60 s ตั้งแต่ 2026-10-23), HTTP_DURATION_DYNAMIC 60 s (4.4),
                   IDLE_DURATION 10 s, SETTLE 1 s
   rep             10 ทุกข้อของชุดใหม่ (ข้อ 0.1-3.5)  ข้อ 4 10 rep (sat 1) (REPS=n ตั้งทุกตัวพร้อมกัน)
   HTTP            wrk2 (ไม่มีใช้ h2load --rps + --log-file)  128 connection  ไฟล์ 1k 10k 100k 1m mix
@@ -114,7 +121,8 @@
   load level      % ของ C0 แบบ open-loop: 1.2 = 75, 4.x = 50 75 90  + sat ตามข้อ
   TCP stream      iperf 16 stream 40 s
   quota           equal 100/100/100% (0.1 1 3)  unequal 100/50/25% (0.2, pilot)
-                  ข้อ 4 CPU รวม 0.9 core: balanced 30/30/30  skewed 60/20/10  oneslow 40/40/10
+                  ข้อ 4 ตั้งเป็นอัตราส่วนความสามารถ 1 ส่วน = 40%: 1-1-1 = 40/40/40  1-1-0.5 = 40/40/20
+                  1-0.5-0.5 = 40/20/20  1-0.5-0.25 = 40/20/10  (ตั้งแต่ 2026-10-31  เดิม 30/30/30 60/20/10 40/40/10)
                   dynamic 30/30/30 → 30/30/10% ที่ 1/3 ของรอบ  CFS period 10 ms (ค่าเริ่มต้น 100 ms ทำให้ p99 เพี้ยน)
   ข้อ 2           TEST2_PPS 40k: NEW ไม่เกิน conntrack max (40k × 20 s = 800k)
 
@@ -125,32 +133,45 @@
   0.1  C0 quota 100/100/100%      workload = web-1k 10k 100k 1m mix         ยิงตรง 3 backend พร้อมกันแบบ sat ไม่มี LB    ./run_tests.sh 0.1
                                   elephant, web-1k-close                    wrk2 42/43/43 conn, iperf 5/5/6 stream, 40 s
   0.2  C0 quota 100/50/25%        workload 6 แบบ (ไม่มี web-1k-close)        เหมือน 0.1 (ใช้ใน pilot)                   ./run_tests.sh 0.2
-  0.3  C0 ของข้อ 4                 quota = balanced skewed oneslow          web-1k เหมือน 0.1 (CPU รวม 0.9 core)       ./run_tests.sh 0.3
+  0.3  C0 ของข้อ 4                 scenario = 1-1-1 1-1-0.5 1-0.5-0.5       web-1k เหมือน 0.1                          ./tcase/0.3.sh
+                                  1-0.5-0.25 (1 ส่วน = quota 40%)
                                   dynamic_after (4 แบบ)
-  1.1  UDP: CPU ต่อ packet         mode = xdp ipvs nft ipt nginx            flow EST, 20 s, 10 rep, idle ต่อ mode       ./run_tests.sh 1.1
-                                  A: 64 B × 50k 100k 250k 500k 1M pps
+  1.1  UDP: CPU ต่อ packet         mode = xdp ipvs nft ipt nginx            flow EST, 60 s, 10 rep, idle ต่อ mode       ./run_tests.sh 1.1
+                                  A: 64 B × 50k 100k 250k 500k 750k 1M pps
                                   B: 512 1024 1400 B × 50k pps
-  1.2  HTTP 1 KB: CPU ต่อ request  mode = xdp ipvs nft ipt nginx haproxy    web-1k 128 conn 40 s, C0 จากข้อ 0.1        ./run_tests.sh 1.2
+  1.2  HTTP 1 KB: CPU ต่อ request  mode = xdp ipvs nft ipt nginx haproxy    web-1k 128 conn 60 s, C0 จากข้อ 0.1        ./run_tests.sh 1.2
                                   connection = keep-alive, close  load = 75%, sat
-  1.3  TCP stream: CPU ต่อ Gbit    mode = เหมือน 1.2                         iperf 16 stream 40 s                       ./run_tests.sh 1.3
-  1.4  latency ที่ LB เพิ่ม          mode = direct (3 ชุด) + เหมือน 1.2       web-1k open-loop 1,000 req/s 128 conn      ./run_tests.sh 1.4
+  1.3  TCP stream: CPU ต่อ Gbit    mode = เหมือน 1.2                         iperf 16 stream 60 s                       ./run_tests.sh 1.3
+  1.4  latency ที่ LB เพิ่ม          mode = direct (3 ชุด) + เหมือน 1.2       web-1k open-loop 1,000 req/s 128 conn 60 s ./run_tests.sh 1.4
   2.1  เวลาเลือก rule: xdp (hash)  VIP = 1 10 100 1000 (ชุด 10.100.0.x)      UDP 64 B 40k pps flow NEW, 20 s, 10 rep   ./run_tests.sh 2.1
                                   pattern = spread, last                   VIP ละ 1 backend  xdp: bpf_stats
   2.2  เวลาเลือก rule: nft (map)   เหมือน 2.1                                bpftrace nft_do_chain (table perf_lb)     ./run_tests.sh 2.2
   2.3  เวลาเลือก rule: ipt (เรียง)  เหมือน 2.1                                iptables-legacy, bpftrace ipt_do_table    ./run_tests.sh 2.3
   3.0  ไม่มี LB                     flow = EST, NEW  ×  pps = 500k, 100k     pktgen thread ละ backend ยิงตรง C, 10 rep  ./run_tests.sh 3.0
   3.1  xdp-hash / xdp / +daemon   variant 3 แบบ × flow × pps เหมือน 3.0     bpf_stats เปิด, 10 rep                     ./run_tests.sh 3.1
-  3.2  เปิด fragment handling      flow × pps เหมือน 3.0                     ไม่มี fragment                              ./run_tests.sh 3.2
-  3.3  fragment ปนกับ UDP ปกติ      fragment = 0 (=3.2) 10 20 50 70 90%       รวม 100k pps: UDP 64 B EST +               ./run_tests.sh 3.3
-                                                                            datagram 908 B 2 fragment ไป port 8081
+  3.2  ปิด/เปิด fragment handling  fragment = off, on                       UDP 64 B EST ไม่มี fragment, 1 core,       ./tcase/3.2.sh
+       กับ UDP ปกติ                × pps = 100k-1M ขั้นละ 100k              perf stat, 60 s, 10 rep
+  3.3  fragment อย่างเดียว          fragment = off, on                       datagram 2 ชิ้น ชิ้นละ frame 90 B          ./tcase/3.3.sh
+                                  × datagram/s = 20k-200k ขั้นละ 20k       ไป port 8081, tcpreplay, 1 core, 60 s, 10 rep
   3.4  PMTU (DF)                  ขนาด IP = 1470 (อ้างอิง), 1490 B          50k pps, pmtu เปิด                         ./run_tests.sh 3.4
-  3.5  frag cache ถูกท่วม          -                                         flood source สุ่ม 100k datagram/s 20 s +   ./run_tests.sh 3.5
-                                                                            flow ปกติ 1k datagram/s ไป port 8081
-  4.1  อัลกอริทึม balanced           LB:algo 9 แบบ (หัวข้อ 10)                  web-1k 128 conn 40 s, quota 30/30/30%     ./run_tests.sh 4.1
+  3.5  จำนวน fragment ต่อ datagram  N = 1-10 ชิ้น (1 = ไม่แบ่ง)              fragment เปิด, 100k packet/s ทุก N,        ./tcase/3.5.sh
+                                                                           ชิ้นละ frame 90 B, tcpreplay, perf stat, 60 s, 10 rep
+  ลบแล้ว (2026-10-29) ตามคำแนะนำของอาจารย์: ระดับไม่เท่ากัน ตัวเลขทศนิยม และ traffic หลายแบบปนกันทำให้นำเสนอยาก
+    3.2 เดิม  เปิด fragment handling (ไม่มี fragment) วัด xdp_ns ด้วย bpf_stats ที่ EST/NEW × 500k 100k
+    3.3 เดิม  fragment 10 20 50 70 90% ปนกับ UDP 64 B ปกติ รวม 100k pps ด้วย hping3
+    3.5 เดิม  frag cache ถูก flood ด้วย source สุ่ม (hping3 --rand-source) + flow ปกติ 1k datagram/s
+    3.2 3.3 ใหม่รันครั้งแรก (2026-10-30) โดย B ใช้ทุก core ผลอยู่ที่ 3.2-allcore 3.3-allcore  แล้วเปลี่ยนเป็น 1 core
+    แบบ 1.6 (2026-11-02) เพื่อให้ % CPU เทียบกันตรงๆ
+    แทนด้วย 3.2 3.3 3.5 ข้างบน  ไฟล์เดิม: archive/test32-33-35-removed-20261029.tgz
+    ผลเดิม: results/20261018/removed-3.2 removed-3.3 removed-3.3-run4 removed-3.5 replaced-3.3-run1 replaced-3.3-run2
+  4.0  baseline ไม่ผ่าน LB           fit (แบ่งตามความสามารถ), equal (เท่ากัน)  ยิงตรง backend ที่ load เดียวกับ 4.x       ./tcase/4.0.sh
+                                  × scenario × load  + 4.4 แบบ equal          single = sat backend ตัวเดียว quota 40 20 10%
+  4.1  อัลกอริทึม 1 : 1 : 1          LB:algo 9 แบบ (หัวข้อ 10)                  web-1k 128 conn 40 s, quota 40/40/40%     ./tcase/4.1.sh
                                   load = 50 75 90% ของ C0 + sat 1 rep      connection ใหม่ทุก 100 request
-  4.2  อัลกอริทึม skewed             เหมือน 4.1                                quota 60/20/10%                           ./run_tests.sh 4.2
-  4.3  อัลกอริทึม oneslow            เหมือน 4.1                                quota 40/40/10%                           ./run_tests.sh 4.3
-  4.4  quota เปลี่ยนกลางรอบ         เหมือน 4.1                                30/30/30% → 30/30/10% ที่ 1/3 ของรอบ        ./run_tests.sh 4.4
+  4.2  อัลกอริทึม 1 : 1 : 0.5        เหมือน 4.1                                quota 40/40/20% (ช้า 1 ตัว)               ./tcase/4.2.sh
+  4.3  อัลกอริทึม 1 : 0.5 : 0.5      เหมือน 4.1                                quota 40/20/20% (เร็ว 1 ตัว)              ./tcase/4.3.sh
+  4.5  อัลกอริทึม 1 : 0.5 : 0.25     เหมือน 4.1                                quota 40/20/10% (ไล่ระดับ)                ./tcase/4.5.sh
+  4.4  quota เปลี่ยนกลางรอบ         เหมือน 4.1                                1-1-1 → 1-1-0.5 ที่ 1/3 ของรอบ              ./tcase/4.4.sh
                                                                            รอบ 60 s, sampler 1 s, convergence_s
   ./run_tests.sh list | plan [ข้อ ...] | pilot | <ข้อย่อย ...> | <ข้อ 0-4> | all | report [dir]   (บน A ด้วย root)
 
@@ -158,7 +179,7 @@
 ------------------------------------------------------------------------
   measurement บน testbed จริง + emulation: backend = netns + cgroup quota บน C, backend ช้า = CPUQuota,
   ไม่มี LB = A ยิงตรง backend
-  เครื่องมือ: pktgen (UDP ทั้งหมด), hping3 หรือ tcpreplay (fragment, DF), wrk2/h2load (HTTP), iperf2 (stream)
+  เครื่องมือ: pktgen (UDP ทั้งหมด), tcpreplay (fragment ข้อ 3.3 3.5), hping3 หรือ tcpreplay (DF), wrk2/h2load (HTTP), iperf2 (stream)
     A  apt: hping3 iperf nghttp2-client tcpreplay ethtool python3 sysstat linux-modules-$(uname -r) (pktgen)
        wrk2: git clone https://github.com/giltene/wrk2 && make -C wrk2 && cp wrk2/wrk /usr/local/bin/wrk2
     B  apt: clang make linux-tools-common jq ipvsadm nftables iptables conntrack nginx libnginx-mod-stream haproxy sysstat
@@ -193,10 +214,10 @@
              6  2.1  xdp                                                80   0.49
              7  3.0  ไม่มี LB                                            50   0.28
              8  3.1  xdp-hash / xdp / xdp-awfd                         150   0.83
-             9  3.2  fragment เปิด                                       50   0.28
-            10  3.3  fragment ปน 10 20 50 70 90%                         60   0.34  ⚠ ดูปัญหาค้างข้างล่าง (run 3 ปกติ)
+             9  3.2  fragment เปิด                                       50   0.28  (ลบแล้ว 2026-10-29)
+            10  3.3  fragment ปน 10 20 50 70 90%                         60   0.34  (ลบแล้ว 2026-10-29)
             11  3.4  PMTU                                               30   0.16
-            12  3.5  frag cache ถูกท่วม                                   20   0.09
+            12  3.5  frag cache ถูกท่วม                                   20   0.09  (ลบแล้ว 2026-10-29)
                                                           รวมช่วง A    690   4.7
     ช่วง B  13  1.1  ipvs nft ipt nginx                                360   2.09
             14  1.2  ipvs nft ipt nginx haproxy                        250   2.50
@@ -206,15 +227,26 @@
             18  2.3  ipt (iptables-legacy)                              80   0.49
                                                           รวมช่วง B    920   6.9
     รวม 1,610 รอบ ~11.6 ชม.  (เดิม 3-5 rep 603 รอบ ~4.2 ชม.)
-  ⚠ ปัญหาค้าง (ยังไม่รู้สาเหตุ  ใช้ผล run 3 สรุป)
+  ปัญหาของ 3.3 เดิม (ไม่รู้สาเหตุ  ข้อถูกลบ 2026-10-29  3.3 ใหม่ใช้ tcpreplay แทน hping3 จึงตรวจซ้ำได้จาก frag_miss)
     3.3: 3 จาก 150 รอบ (run 1-2) B หาชิ้นที่ 2 ใน frag_cache_map ไม่เจอทั้งรอบ (frag_hit ≈ 0, frag_miss = ทุกตัว)
          run 1: 20%-r10   run 2: 50%-r3 90%-r3   run 3 (tcpdump บน A ตลอดรอบ) ไม่พบ   ชุดเก่า (old-20261018) ไม่พบ
          ตัดออกแล้ว: fragment handling ปิด (ถ้าปิดจะไม่นับ frag_miss), เก็บชิ้นแรกไม่สำเร็จ (frag_store_failed = 0),
                      ชิ้นส่วนเข้าคนละคิว (ทุก fragment เข้าคิวเดียวกัน)
          รอบถัดไปที่ C ประกอบได้ ~77%: ชิ้นแรกที่ค้างจากรอบที่เสียเต็มหน่วยความจำ reassembly ของ C (timeout 30 s)
          สงสัย IP ID ของ hping3 หรือ LRU map ของ xdp_lb  ตรวจหลังช่วง B: tcpdump บน A/B หรือยิงซ้ำด้วย tcpreplay
-         ผล: results/20261018/3.3 (run 3)  replaced-3.3-run1, replaced-3.3-run2  รายละเอียดใน 3.3/ISSUE.txt
-  ข้อ 4: quota ทุกแบบรวม 0.9 core ให้ backend ตันก่อนสาย 1G (C0 ของ web-1k ~52k req/s ~540 Mbit/s)
+         ผล: results/20261018/removed-3.3 (run 3)  replaced-3.3-run1, replaced-3.3-run2  รายละเอียดใน removed-3.3/ISSUE.txt
+  ข้อ 4 (ตั้งแต่ 2026-10-31 ตามคำแนะนำของอาจารย์): scenario เป็นอัตราส่วนความสามารถ 1 ส่วน = quota 40%
+    1-1-1 รวม 1.2 core คาด ~720 Mbit/s ยังไม่ถึงเกณฑ์ link-bound (846 Mbit/s)  0.3 ตรวจจริงก่อนรัน 4.x
+    baseline 4.0 ไม่ผ่าน LB: fit = แบ่ง rate/connection ตาม quota (กรณีดีที่สุด), equal = แบ่งเท่ากัน, single = ความสามารถต่อ quota
+    ผลชุดเดิม (1 ส่วน = 30%: 30/30/30 60/20/10 40/40/10 30/30/10) ย้ายไป results/20261018/q30-0.3 q30-4.1 ... q30-4.4
+    load ของข้อ 4: run1 (2026-10-31) ใช้ 50 75 90% ของ C0 แต่ทางผ่าน LB รับได้แค่ Ω ≈ 0.88-0.92 ของ C0 (C0 ยิงตรง)
+      ระดับ 90% จึงล้นเกือบทุก LB  run2 (2026-11-02) ใช้ 50 60 70 80% (TEST4_LEVELS) ต่ำกว่าเพดาน ไม่รัน sat และ single ซ้ำ
+      ผล run1 (มี sat/Ω, 75%, 90%, 4.0 single) อยู่ที่ results/20261018/4.0-run1 ... 4.5-run1  run2 อยู่ที่ 4.0 ... 4.5
+    xdp:awfd4s = awfd4 ที่แก้ herding (EWMA ของ U -a 30, floor -f 25  load_aware/DESIGN.md หัวข้อ 11)  ผลที่ 4.x-awfd4s
+      ใช้ load เดียวกับ run2 + sat 3 rep  ค่า b<i>_conn_pct เริ่มมีในชุดนี้
+    IRQ ของ B: หลังถอด/ใส่ XDP การ์ด reset และ kernel กระจาย IRQ ของ 8 คิวไปทุก core เอง (ไม่ได้ผูก 0-3 ตามหัวข้อ 1)
+      ข้อ 4 run1 run2 และ 3.x ชุดใหม่รันในสภาพนี้ทั้งหมด  B ไม่ใช่คอขวดของข้อ 4
+  ข้อ 4 ชุดเดิม: quota ทุกแบบรวม 0.9 core ให้ backend ตันก่อนสาย 1G (C0 ของ web-1k ~52k req/s ~540 Mbit/s)
     ไฟล์ 10k ขึ้นไปติดสายแม้ลด quota จึงใช้ web-1k อย่างเดียว  C0 ที่ link_bound = 1 สคริปต์ไม่รันข้อนั้น
     sat แยกอัลกอริทึมไม่ได้ (ทุก backend ถูกใช้เต็ม Ω ≈ 1) จึงรันแค่ 1 rep ไว้เช็ค Ω < 0.9
     variant (TEST4_VARIANTS = <LB>:<อัลกอริทึม>)  ตัวแทนของแต่ละ LB: แบ่งเท่ากัน / ถ่วงน้ำหนักคงที่ / ดูภาระ
@@ -242,8 +274,8 @@
 ------------------------------------------------------------------------
   แต่ละแถว = mean ± CI95 (t, n−1), n และ CV  ค่าไหน CV > 10% ติด "!"
   ไม่เอามาเฉลี่ย: traffic_error, invalid=rate (ยิงได้ < 95% ของเป้า), profile ไม่ผ่านเกณฑ์ conn_new_ratio
-  3.3 3.4 วัดความถูกต้อง ไม่ตัดด้วย invalid=rate / เกณฑ์ EST: รายงาน x = สั่ง hping3, y = hping3 ส่งจริง,
-  z = สำเร็จ (ประกอบได้ / ถึง backend / ICMP) และ frag_share_pct = สัดส่วน fragment จริง
+  3.4 วัดความถูกต้อง ไม่ตัดด้วย invalid=rate / เกณฑ์ EST: รายงาน x = สั่ง hping3, y = hping3 ส่งจริง,
+  z = สำเร็จ (ถึง backend / ICMP)
   ส่งออก runs.csv (รายรอบ) และ summary.csv (mean ci95 n cv ต่อ metric)
   ชี้ bottleneck: A = a_cores ใกล้ 8 หรือ invalid=rate  link = ป้าย link_bound / C0 link-bound
                   B = lb_cores สูง, q_max_share ของคิวเดียวสูง, loss_lb > 0  C = c_rx_drops > 0, b<i>_util ≈ 1
@@ -254,14 +286,22 @@
   1.1  ns_per_fwd_pkt และ loss_lb เทียบ pps (เส้นต่อ mode) + แท่งต่อขนาด
   1.2  แท่ง cpu_us_per_req (keep-alive / close) + throughput ที่ sat    1.3  แท่ง cores_per_gbit + avg_pkt_bytes
   1.4  แท่ง Δp50 / Δp99 ต่อ mode    2  lookup_ns เทียบจำนวน VIP (log) เส้นต่อ mode แยก spread/last
-  3    แท่งซ้อน xdp_ns ทีละขั้น, frag_delivery_pct เทียบ fragment %, icmp_ratio
-  4    p99 เทียบ load level ต่ออัลกอริทึม แยก scenario, b<i>_req_pct เทียบสัดส่วน quota, balance ตามเวลาของ 4.4 (จาก .ts)
+  3    แท่งซ้อน xdp_ns ทีละขั้น (3.0 3.1), icmp_ratio (3.4)
+       3.2  cpu_cores เทียบ pps เส้น off / on      3.3  แท่ง frag_delivery_pct และ cpu_cores ต่อ datagram/s แยก off / on
+       3.5  cpu_ns_per_pkt และ cpu_ns_per_datagram เทียบจำนวนชิ้น N  (ตัวเลขบนกราฟเป็นจำนวนเต็ม)
+  4    p99 เทียบ load level ต่ออัลกอริทึม แยก scenario พร้อมเส้น baseline 4.0 (fit, equal), b<i>_req_pct เทียบสัดส่วน
+       ความสามารถ (1-1-0.5 = 40/40/20%), balance ตามเวลาของ 4.4 (จาก .ts)  ชื่อ scenario แสดงเป็นอัตราส่วน
 
 13. สมมติฐานและข้อจำกัด
 ------------------------------------------------------------------------
   - link 1G เส้นเดียว: B รับและส่งทาง eno1 เดียว ขาออกหลังห่อ IPIP (~1.20 Mpps ที่ 64 B) คือเพดาน
   - xdp/ipvs เป็น DSR (B เห็นแค่ขาไป) ส่วน nft/ipt/nginx/haproxy ขากลับผ่าน B ด้วย
     CPU ต่อ request จึงเป็นต้นทุนรวมของแต่ละแบบ ไม่ใช่ต้นทุนต่อ packet ที่เทียบกันตรง ๆ
+  - NIC ของ C เป็น e1000e คิวเดียว (ethtool -l ไม่รองรับ, IRQ เดียวบน CPU 0): การรับ, XDP ถอด IPIP (generic)
+    และการประกอบ fragment ของ C ทำบน core เดียว  เกิน ~500k packet/s (64-90 B) NIC ของ C ทิ้ง (rx_missed_errors)
+    ตัวเลขฝั่ง backend (loss_e2e, frag_delivery_pct) ที่อัตราสูงจึงเป็นเพดานของ C ไม่ใช่ของ LB  เช่น 1.1 ที่ 1M
+    loss_e2e ~49% ขณะที่ loss_lb ≈ 0  ข้อ 3.3 3.5 จึงยิงไม่เกิน 400k packet/s  (ตรวจ 2026-10-29)
+  - tcpreplay บน A ยิง frame 90 B ได้ ~700k packet/s (ตรวจ 2026-10-29)
   - backend 3 ตัวอยู่บน C เครื่องเดียว ใช้ NIC/IRQ ร่วมกัน  traffic เป็นแบบสังเคราะห์ (ไฟล์คงที่, flow ไล่ลำดับ)
   - deencap บน veth เป็น generic XDP; bpf_stats เพิ่ม overhead ต่อ packet ตัวเลขข้อ 2, 3 เทียบตรงกับข้อ 1 ไม่ได้
   - ผลใช้ได้กับ 1G / 8 core / ค่าในหัวข้อ 6 เท่านั้น
@@ -278,7 +318,8 @@
   - ข้อ 4 เทียบทั้งระบบ: ผลปนระหว่างอัลกอริทึมกับสถาปัตยกรรม (xdp/ipvs DSR, nft/ipt ขากลับผ่าน B, nginx/haproxy proxy ที่รู้
     จำนวน connection จริง)  น้ำหนักของ least-connection คงที่ตาม quota ตอนเริ่มรอบ  แต่ละก้อนวัดคนละช่วงเวลา
   - ข้อ 4 ใช้แค่ web-1k: ผลบอกพฤติกรรมเมื่อ backend ตันด้วย CPU ไม่ครอบคลุมกรณีที่สายเป็นคอขวด
-  - pktgen ตั้ง DF และแบ่ง fragment ไม่ได้ 3.3-3.5 จึงใช้ hping3 (หรือ RAW_TOOL=tcpreplay) ซึ่งอาจทำ rate ไม่ถึง
+  - pktgen ตั้ง DF และแบ่ง fragment ไม่ได้: 3.4 ใช้ hping3 (หรือ RAW_TOOL=tcpreplay) ซึ่งอาจทำ rate ไม่ถึง
+    3.3 3.5 ใช้ tcpreplay กับ pcap ที่แบ่ง fragment ไว้แล้ว (16,384 datagram วนซ้ำ  IP ID ซ้ำทุก 16,384 datagram)
   - ตรวจบนเครื่องจริงยังไม่ได้ (เลือกทางที่ปลอดภัยไว้แล้ว และ pilot ตรวจซ้ำ)
       driver และ RSS เริ่มต้น       tune_machine ตั้ง sdfn ทุกครั้งแล้วพิมพ์ค่า, report แสดง q_share
       XDP_TX/REDIRECT ใน tx_packets  ใช้ xdp_redirect / xdp_tx ของ xdp_lb_ctl stats แทน
