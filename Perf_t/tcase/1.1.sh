@@ -1,54 +1,34 @@
 #!/bin/bash
-DURATION=${DURATION:-60}
-source "$(dirname "${BASH_SOURCE[0]}")/run_lib.sh"
+REPS=10
+DURATION=60
+IDLE_DURATION=10
+LB_LIST="xdp ipvs nft ipt nginx"
+UDP_POINTS="64:50000 64:100000 64:250000 64:500000 64:750000 64:1000000
+            128:50000 128:100000 128:250000 128:500000
+            512:50000 512:100000
+            1024:50000 1024:100000"
+source "$(dirname "$0")/run_lib.sh"
 
-udp_points() {
-    local pps size
-    if [ -n "${UDP_POINTS:-}" ]; then
-        printf '%s\n' $UDP_POINTS
-        return
-    fi
-    for pps in $PPS_LADDER $STRESS_PPS; do echo 64:$pps; done
-    for size in $SIZES; do echo $size:$SIZE_SWEEP_PPS; done
-}
+start_test 1.1 "$@"
 
-one_round() {
-    local mode=$1 size=$2 pps=$3 rx0 rx1 miss0 miss1 fwd0 fwd1 udp0 udp1
-    round_begin $TEST-$mode-$size-$pps $DURATION "test=$TEST mode=$mode size=$size pps=$pps \
-link_bound=$(( pps * (size + 40) * 8 >= 950000000 )) $(flow_meta est $EST_PORTS)" || return 0
-    reset_b
-    rx0=$(cmd b "$B_NIC/rx_packets")
-    miss0=$(cmd b "$B_NIC/rx_missed_errors")
-    fwd0=$(forwarded $mode)
-    udp0=$(cmd c "$C_UDP_IN")
-    read_counters 0
-    cpu_begin
-    traffic pktgen dst_mac=$LB_MAC dst=$VIP size=$size pps=$pps seconds=$DURATION
-    cpu_end
-    read_counters 1
-    round_end
-    rx1=$(cmd b "$B_NIC/rx_packets")
-    miss1=$(cmd b "$B_NIC/rx_missed_errors")
-    fwd1=$(forwarded $mode)
-    udp1=$(cmd c "$C_UDP_IN")
-    delta "B rx_packets" "$rx0" "$rx1"
-    delta "B rx_missed_errors" "$miss0" "$miss1"
-    delta "B ส่งต่อ" "$fwd0" "$fwd1"
-    delta "C udp_in (3 backend)" "$udp0" "$udp1"
-    show_cpu b
-}
+for rep in $(seq $REPS); do
+    for mode in $(select_lb $LB_LIST); do
+        switch_lb $mode
+        run_idle_round $TEST-$mode "test=$TEST mode=$mode"
 
-t1_1() {
-    local mode point
-    for rep in $(seq $REPS_UDP); do
-        for mode in $TEST1_MODES; do
-            if [ $mode = haproxy ]; then continue; fi
-            use_mode $mode
-            idle_round $TEST-$mode "test=$TEST mode=$mode"
-            for point in $(udp_points | awk '!seen[$0]++'); do one_round $mode ${point%:*} ${point#*:}; done
+        for point in $UDP_POINTS; do
+            size=${point%:*} pps=${point#*:}
+            begin_round $TEST-$mode-$size-$pps "test=$TEST mode=$mode size=$size pps=$pps \
+link_bound=$(( pps * (size + 40) * 8 >= 950000000 )) $(flow_meta est $EST_PORTS)"
+            reset_lb
+            read_counters_begin
+            read_cpu_begin
+            run_traffic pktgen dst_mac=$LB_MAC dst=$VIP size=$size pps=$pps seconds=$DURATION
+            read_cpu_end
+            read_counters_end
         done
     done
-    restore
-}
+done
 
-run_one 1.1 "$@"
+restore
+write_result

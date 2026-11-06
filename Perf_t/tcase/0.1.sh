@@ -1,31 +1,26 @@
 #!/bin/bash
-source "$(dirname "${BASH_SOURCE[0]}")/run_lib.sh"
+REPS=10
+HTTP_DURATION=40
+WORKLOADS="web-1k web-10k web-100k web-1m web-mix elephant web-1k-close"
+source "$(dirname "$0")/run_lib.sh"
 
-one_round() {
-    local load=$1 r0 r1
-    round_begin $TEST-$load $HTTP_DURATION "test=$TEST scenario=equal workload=$load level=sat streams=$STREAMS $(http_meta)" ||
-        return 0
-    reset_b
-    r0=$(cmd c "$C_REQUESTS")
-    read_counters 0
-    cpu_begin
-    traffic direct3 $load sat
-    cpu_end
-    read_counters 1
-    round_end
-    r1=$(cmd c "$C_REQUESTS")
-    delta_requests "$r0" "$r1"
-    show_cpu c
-}
+start_test 0.1 "$@"
 
-t0_1() {
-    local load B_OFF_PATH=1
-    on_c mode direct
-    on_c quota ${QUOTA[equal]} >/dev/null
-    for rep in $(seq $REPS_HTTP); do
-        for load in $(web_loads) elephant web-1k-close; do one_round $load; done
+B_OFF_PATH=1
+on_c mode direct
+on_c quota ${QUOTA[equal]} >/dev/null
+
+for rep in $(seq $REPS); do
+    for load in $WORKLOADS; do
+        begin_round $TEST-$load "test=$TEST scenario=equal workload=$load level=sat streams=$STREAMS $(http_meta)"
+        reset_lb
+        read_counters_begin
+        read_cpu_begin
+        run_traffic direct3 $load sat
+        read_cpu_end
+        read_counters_end
     done
-    restore
-}
+done
 
-run_one 0.1 "$@"
+restore
+write_result

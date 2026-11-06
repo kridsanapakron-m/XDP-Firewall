@@ -1,45 +1,37 @@
 #!/bin/bash
-DURATION=${DURATION:-60}
-IDLE_DURATION=${IDLE_DURATION:-60}
-REPS_TEST3=${REPS_TEST3:-${REPS:-10}}
-TEST32_PPS=${TEST32_PPS:-"100000 200000 300000 400000 500000 600000 700000 800000 900000 1000000"}
-TEST3_REST=${TEST3_REST:-10}
-source "$(dirname "${BASH_SOURCE[0]}")/run_lib.sh"
+REPS=10
+DURATION=60
+IDLE_DURATION=60
+REST=10
+PPS_LIST="100000 200000 300000 400000 500000 600000 700000 800000 900000 1000000"
+source "$(dirname "$0")/run_lib.sh"
 
-one_round() {
-    local fragment=$1 pps=$2 fwd0 fwd1
-    round_begin $TEST-$fragment-64-$pps $(( DURATION + TEST3_REST )) "test=$TEST variant=xdp fragment=$fragment lb_cores=1 \
-size=64 pps=$pps $(flow_meta est $EST_PORTS)" || return 0
-    reset_one_core
-    fwd0=$(forwarded xdp)
-    read_counters 0
-    cpu_begin
-    core0_begin
-    traffic pktgen dst_mac=$LB_MAC dst=$VIP size=64 pps=$pps seconds=$DURATION
-    core0_end
-    cpu_end
-    read_counters 1
-    round_end
-    fwd1=$(forwarded xdp)
-    delta "B ส่งต่อ" "$fwd0" "$fwd1"
-    per_unit0 packet $(( fwd1 - fwd0 ))
-    sleep $TEST3_REST
-}
+start_test 3.2 "$@"
+prepare_one_core
+on_c mode guarded
+on_c quota ${QUOTA[equal]} >/dev/null
+on_b mode xdp >/dev/null
 
-t3_2() {
-    local fragment pps
-    one_core_start
-    on_c mode guarded
-    on_c quota ${QUOTA[equal]} >/dev/null
-    on_b mode xdp >/dev/null
-    for rep in $(seq $REPS_TEST3); do
-        for fragment in off on; do
-            on_b feature fragment $fragment
-            idle_one_core $TEST-$fragment "test=$TEST variant=xdp fragment=$fragment lb_cores=1"
-            for pps in $TEST32_PPS; do one_round $fragment $pps; done
+for rep in $(seq $REPS); do
+    for fragment in off on; do
+        on_b feature fragment $fragment
+        run_idle_one_core $TEST-$fragment "test=$TEST variant=xdp fragment=$fragment lb_cores=1"
+
+        for pps in $PPS_LIST; do
+            begin_round $TEST-$fragment-64-$pps "test=$TEST variant=xdp fragment=$fragment lb_cores=1 \
+size=64 pps=$pps $(flow_meta est $EST_PORTS)"
+            reset_lb_one_core
+            read_counters_begin
+            read_cpu_begin
+            read_core0_begin
+            run_traffic pktgen dst_mac=$LB_MAC dst=$VIP size=64 pps=$pps seconds=$DURATION
+            read_core0_end
+            read_cpu_end
+            read_counters_end
+            sleep $REST
         done
     done
-    restore
-}
+done
 
-run_one 3.2 "$@"
+restore
+write_result

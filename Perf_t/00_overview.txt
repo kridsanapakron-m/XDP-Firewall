@@ -117,7 +117,7 @@
                   NEW = 125 × 64,511 port (coprime) × 2 = 16.1M tuple ≥ 500k × 20 s  ไม่วนซ้ำในรอบ
   เวลา            DURATION 20 s (UDP), HTTP_DURATION 40 s (ข้อ 1 ทั้งหมด 60 s ตั้งแต่ 2026-10-23), HTTP_DURATION_DYNAMIC 60 s (4.4),
                   IDLE_DURATION 10 s, SETTLE 1 s
-  rep             10 ทุกข้อของชุดใหม่ (ข้อ 0.1-3.5)  ข้อ 4 10 rep (sat 1) (REPS=n ตั้งทุกตัวพร้อมกัน)
+  rep             10 ทุกข้อของชุดใหม่ (ข้อ 0.1-3.5)  ข้อ 4 10 rep (sat 1) (ค่า REPS และเวลาเขียนตรงๆ ต้นไฟล์ tcase  ถ้าจะลองสั้นๆ ให้แก้ในไฟล์)
   HTTP            wrk2 (ไม่มีใช้ h2load --rps + --log-file)  128 connection  ไฟล์ 1k 10k 100k 1m mix
                   web-mix = 1k 70%, 10k 20%, 100k 9%, 1m 1% (wrk2 ใช้ mix.lua)
   load level      % ของ C0 แบบ open-loop: 1.2 = 75, 4.x = 50 75 90  + sat ตามข้อ
@@ -150,7 +150,7 @@
   2.2  เวลาเลือก rule: nft (map)   เหมือน 2.1                                bpftrace nft_do_chain (table perf_lb)     ./run_tests.sh 2.2
   2.3  เวลาเลือก rule: ipt (เรียง)  เหมือน 2.1                                iptables-legacy, bpftrace ipt_do_table    ./run_tests.sh 2.3
   3.0  ไม่มี LB                     flow = EST, NEW  ×  pps = 500k, 100k     pktgen thread ละ backend ยิงตรง C, 10 rep  ./run_tests.sh 3.0
-  3.1  xdp-hash / xdp / +daemon   variant 3 แบบ × flow × pps เหมือน 3.0     bpf_stats เปิด, 10 rep                     ./run_tests.sh 3.1
+  3.1  xdp-hash / xdp-awfd        variant 2 แบบ × flow × pps เหมือน 3.0     bpf_stats เปิด, 10 rep                     ./run_tests.sh 3.1
   3.2  ปิด/เปิด fragment handling  fragment = off, on                       UDP 64 B EST ไม่มี fragment, 1 core,       ./tcase/3.2.sh
        กับ UDP ปกติ                × pps = 100k-1M ขั้นละ 100k              perf stat, 60 s, 10 rep
   3.3  fragment อย่างเดียว          fragment = off, on                       datagram 2 ชิ้น ชิ้นละ frame 90 B          ./tcase/3.3.sh
@@ -196,7 +196,9 @@
               conntrack -F, ipvs ว่าง)  รอ SETTLE  snapshot A B C พร้อมกัน, เริ่ม mpstat -P ALL 1 ทั้ง 3 เครื่อง,
               ยิง, หยุด mpstat (เก็บ <id>.cpu-{a,b,c}.json.gz), snapshot อีกครั้ง
   รอบ idle ต่อ mode ต่อ rep ในข้อ 1 และ 3  ข้อ 0 ต้องรันก่อน 1.2 4 5 ใน RUN_DIR เดียวกัน (C0 อ่านจาก c0.tsv)
-  RESUME=1 ข้ามรอบที่เสร็จแล้ว (มี t_end_ns ไม่มี traffic_error/invalid) รันต่อได้ถ้าสะดุดกลางทาง
+  tcase/<ข้อ>.sh มีค่าที่รันจริงและลำดับคำสั่งครบในไฟล์  ใช้ฟังก์ชันจาก tcase/run_lib.sh
+  ถ้ามีผลของรอบนั้นแล้ว สคริปต์หยุดทันทีเพื่อไม่เขียนทับ: ใช้ RUN_DIR หรือ CAMPAIGN ใหม่  (ไม่มีการรันต่อจากรอบที่สะดุด)
+  ข้อ 1 และ 4 ใส่ xdp หรือ other เพื่อแยกช่วง (ข้อ 4 ต้องใส่) เช่น ./tcase/4.1.sh xdp
   ชุดใหม่ (ข้อ 0.1-3.5): รันจาก tcase/<ข้อ>.sh ทีละข้อย่อย 10 rep  รอสั่งก่อนเริ่มข้อถัดไปทุกครั้ง
     ผลของแต่ละข้ออยู่ใน results/<ชุด>/<ข้อ>/  (ไฟล์ดิบทุกรอบ + report.txt runs.csv summary.csv ของข้อนั้น)
     1.2 อ่าน C0 จาก results/<ชุด>/0.1/c0.tsv
@@ -244,6 +246,7 @@
     load ของข้อ 4: run1 (2026-10-31) ใช้ 50 75 90% ของ C0 แต่ทางผ่าน LB รับได้แค่ Ω ≈ 0.88-0.92 ของ C0 (C0 ยิงตรง)
       ระดับ 90% จึงล้นเกือบทุก LB  run2 (2026-11-02) ใช้ 50 60 70 80% (TEST4_LEVELS) ต่ำกว่าเพดาน ไม่รัน sat และ single ซ้ำ
       ผล run1 (มี sat/Ω, 75%, 90%, 4.0 single) อยู่ที่ results/20261018/4.0-run1 ... 4.5-run1  run2 อยู่ที่ 4.0 ... 4.5
+    ตั้งแต่ 2026-11-06 tcase ไม่รัน awfd4 เดิมแล้ว  ข้อ 3.1 และข้อ 4 ใช้ awfd4s  ผล awfd4 เดิมยังอยู่ในชุด 20261018
     xdp:awfd4s = awfd4 ที่แก้ herding (EWMA ของ U -a 30, floor -f 25  load_aware/DESIGN.md หัวข้อ 11)  ผลที่ 4.x-awfd4s
       ใช้ load เดียวกับ run2 + sat 3 rep  ค่า b<i>_conn_pct เริ่มมีในชุดนี้
     IRQ ของ B: หลังถอด/ใส่ XDP การ์ด reset และ kernel กระจาย IRQ ของ 8 คิวไปทุก core เอง (ไม่ได้ผูก 0-3 ตามหัวข้อ 1)
@@ -326,4 +329,4 @@
       driver และ RSS เริ่มต้น       tune_machine ตั้ง sdfn ทุกครั้งแล้วพิมพ์ค่า, report แสดง q_share
       XDP_TX/REDIRECT ใน tx_packets  ใช้ xdp_redirect + xdp_tx ของ xdp_lb_stats แทน
       switch รับ frame 1520 B ไหม    ล็อก MTU 1480 ไม่มี frame เกิน 1514 B
-      rate จริงของ pktgen/hping3     ตรวจทุกรอบ ต่ำกว่า 95% = invalid=rate
+      rate จริงของ pktgen/hping3     ดู sent_pps ในรายงาน  ตั้งแต่ 2026-11-06 tcase ไม่ติด invalid=rate อัตโนมัติ

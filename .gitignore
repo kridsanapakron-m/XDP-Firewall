@@ -16,5 +16,6 @@ xdp_lb_awfd
 xdp_lb_agent
 lab*
 Perf_t/results
+Perf_t/raw-data
 Perf_t/export
 Perf_t/tcasewithcomment

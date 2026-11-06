@@ -6,24 +6,8 @@ SCRIPT_DIR=$(dirname "$TCASE_DIR")
 source "$SCRIPT_DIR/perf_env.sh"
 CAMPAIGN=${CAMPAIGN:-20261018}
 RESULTS=$SCRIPT_DIR/results/$CAMPAIGN
-USER_RUN_DIR=${RUN_DIR:-}
-RUN_DIR=${RUN_DIR:-$RESULTS}
 
-DURATION=${DURATION:-20}
-HTTP_DURATION=${HTTP_DURATION:-40}
-HTTP_DURATION_DYNAMIC=${HTTP_DURATION_DYNAMIC:-60}
-IDLE_DURATION=${IDLE_DURATION:-10}
-REPS_UDP=${REPS_UDP:-${REPS:-10}}
-REPS_TEST2=${REPS_TEST2:-${REPS:-10}}
-REPS_TEST3=${REPS_TEST3:-${REPS:-10}}
-REPS_HTTP=${REPS_HTTP:-${REPS:-10}}
 SETTLE=${SETTLE:-1}
-RESUME=${RESUME:-1}
-OVERHEAD=${OVERHEAD:-}
-PPS_LADDER=${PPS_LADDER:-"50000 100000 250000 500000 750000 1000000"}
-SIZES=${SIZES:-"64 512 1024 1400"}
-SIZE_SWEEP_PPS=${SIZE_SWEEP_PPS:-50000}
-STRESS_PPS=${STRESS_PPS:-}
 PKTGEN_THREADS=${PKTGEN_THREADS:-2}
 SRC_PER_THREAD=125
 EST_PORTS=${EST_PORTS:-4}
@@ -32,21 +16,7 @@ CONNS=${CONNS:-128}
 HTTP_THREADS=${HTTP_THREADS:-4}
 SAT_RATE=${SAT_RATE:-2000000}
 STREAMS=${STREAMS:-16}
-WEB_FILES=${WEB_FILES:-"1k 10k 100k 1m mix"}
-HTTP_TOOL=${HTTP_TOOL:-$(command -v wrk2 >/dev/null && echo wrk2 || echo h2load)}
-RAW_TOOL=${RAW_TOOL:-hping3}
-
-TEST1_MODES=${TEST1_MODES:-"xdp ipvs nft ipt nginx haproxy"}
-TEST12_LEVELS=${TEST12_LEVELS:-75}
-LAT_RATE=${LAT_RATE:-1000}
-VIP_COUNTS=${VIP_COUNTS:-"1 10 100 1000"}
-TEST2_PPS=${TEST2_PPS:-40000}
-TEST3_PPS=${TEST3_PPS:-"500000 100000"}
-PMTU_PPS=${PMTU_PPS:-50000}
-TEST4_VARIANTS=${TEST4_VARIANTS:-"xdp:ecmp xdp:wcmp xdp:awfd4"}
-TEST4_LEVELS=${TEST4_LEVELS:-${LOAD_LEVELS:-"50 75 90"}}
 TEST4_AWFD_TUNE=${TEST4_AWFD_TUNE:-"30 25"}
-TEST4_SAT_REPS=${TEST4_SAT_REPS:-1}
 declare -A QUOTA=(
     [equal]=${QUOTA_EQUAL:-"100% 100% 100%"}
     [unequal]=${QUOTA_UNEQUAL:-"100% 50% 25%"}
@@ -58,27 +28,14 @@ declare -A QUOTA=(
 )
 TEST4_SCENARIOS="1-1-1 1-1-0.5 1-0.5-0.5 1-0.5-0.25"
 
-PLAN=""
-LAST_END_NS=""
-declare -A RAN=()
-
 ssh_options="-o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPersist=10m"
 
 source "$TCASE_DIR/cmd.sh"
 
-setup_log() {
-    case $2 in snapshot|cpu|status|env) return 0 ;; esac
-    echo "  $1\$ $3" >&2
-    case $2 in reset|lookup|sample) ;; *) echo "$(date '+%F %T') $1\$ $3" >> "$RUN_DIR/env-a.txt" ;; esac
-}
-on_b() { if [ -z "$PLAN" ]; then setup_log B $1 "setup_b_lb.sh $*"; ssh $ssh_options $SSH_LB "$PERF_DIR/setup_b_lb.sh $*"; fi; }
-on_c() { if [ -z "$PLAN" ]; then setup_log C $1 "setup_c_server.sh $*"; ssh $ssh_options $SSH_SERVER "$PERF_DIR/setup_c_server.sh $*"; fi; }
-vip_route() {
-    if [ -z "$PLAN" ]; then
-        setup_log A route "ip route replace $VIP/32 dev $CLIENT_IFACE $*"
-        ip route replace $VIP/32 dev $CLIENT_IFACE "$@"
-    fi
-}
+on_b() { ssh $ssh_options $SSH_LB "$PERF_DIR/setup_b_lb.sh $*"; }
+on_c() { ssh $ssh_options $SSH_SERVER "$PERF_DIR/setup_c_server.sh $*"; }
+vip_route() { ip route replace $VIP/32 dev $CLIENT_IFACE "$@"; }
+
 c_mode_for() { case $1 in nft|ipt) echo nat ;; *) echo guarded ;; esac; }
 gcd() { if (( $2 )); then gcd $2 $(( $1 % $2 )); else echo $1; fi; }
 lcm() { echo $(( $1 * $2 / $(gcd $1 $2) )); }
@@ -147,43 +104,7 @@ replay() {
                kind, $2 / per, $2, rate, $2 / per / $(NF - 1) }' <<< "$output"
 }
 
-pcap_of() {
-    local file=$RUN_DIR/$1.pcap
-    [ -f $file ] || python3 - $file $1 $(cat /sys/class/net/$CLIENT_IFACE/address) $LB_MAC \
-        $CLIENT_IP $VIP $VPORT <<'PY'
-import socket, struct, sys
-path, kind, src_mac, dst_mac, src, dst, vport = sys.argv[1:]
-ethernet = bytes.fromhex(dst_mac.replace(":", "") + src_mac.replace(":", "")) + b"\x08\x00"
-
-def packet(ident, flags_offset, payload):
-    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), ident, flags_offset, 64, 17, 0,
-                         socket.inet_aton(src), socket.inet_aton(dst))
-    total = sum(struct.unpack("!10H", header))
-    checksum = ~((total & 0xffff) + (total >> 16)) & 0xffff
-    return ethernet + header[:10] + struct.pack("!H", checksum) + header[12:] + payload
-
-packets = []
-for ident in range(8192):
-    size = int(kind[2:])
-    packets.append(packet(ident, 0x4000, struct.pack("!HHHH", 1024 + ident, int(vport), size - 20, 0)
-                          + bytes(size - 28)))
-with open(path, "wb") as out:
-    out.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
-    for data in packets:
-        out.write(struct.pack("<IIII", 0, 0, len(data), len(data)) + data)
-PY
-    echo $file
-}
-
-raw() {
-    if [ $RAW_TOOL = tcpreplay ]; then
-        replay $1 $2 $3 $(pcap_of $1) 1
-    else
-        hping $1 $2 $3 --udp -p $VPORT -y -d $(( ${1#df} - 28 )) $VIP
-    fi
-}
-
-frag_pcap() {
+make_frag_packet_file() {
     local file=$RUN_DIR/frag$1.pcap
     [ -f $file ] || python3 - $file $1 $(cat /sys/class/net/$CLIENT_IFACE/address) $LB_MAC \
         $CLIENT_IP $VIP $VPORT_FRAG <<'PY'
@@ -211,7 +132,7 @@ PY
     echo $file
 }
 
-frag() { replay frag $(( $2 / $1 )) $3 $(frag_pcap $1) $1; }
+frag() { replay frag $(( $2 / $1 )) $3 $(make_frag_packet_file $1) $1; }
 
 mix_lua() {
     local file=$RUN_DIR/mix.lua
@@ -234,33 +155,18 @@ LUA
     echo $file
 }
 
-uri_file() {
-    local file=$RUN_DIR/uris-$1.txt entry n
-    if [ ! -f $file ]; then
-        for entry in f1k:70 f10k:20 f100k:9 f1m:1; do
-            for ((n = 0; n < ${entry##*:}; n++)); do echo "http://$1:$VPORT/${entry%%:*}"; done
-        done | shuf --random-source=<(yes) > $file
-    fi
-    echo $file
-}
+raw() { hping $1 $2 $3 --udp -p $VPORT -y -d $(( ${1#df} - 28 )) $VIP; }
 
 http() {
     local host=$1 file=$2 rate=$3 conns=$4 close=${5:+-H Connection:close}
     local threads=$(( conns < HTTP_THREADS ? conns : HTTP_THREADS )) url=http://$1:$VPORT/f${2/mix/1k}
-    if [ $HTTP_TOOL = wrk2 ]; then
-        [ $rate = sat ] && rate=$SAT_RATE
-        show wrk2 -t $threads -c $conns -d ${HTTP_DURATION}s -R $rate --latency $close \
-            $([ $file = mix ] && echo -s $(mix_lua)) $url
-    else
-        show h2load --h1 -t $threads -c $conns -D $HTTP_DURATION --warm-up-time 2 $close \
-            $([ $rate = sat ] || awk -v r=$rate -v c=$conns 'BEGIN {printf "--rps %.4f", r / c}') \
-            --log-file "$out.lat$part" $([ $file = mix ] && echo -i $(uri_file $host) || echo $url)
-    fi
+    [ $rate = sat ] && rate=$SAT_RATE
+    show wrk2 -t $threads -c $conns -d ${HTTP_DURATION}s -R $rate --latency $close \
+        $([ $file = mix ] && echo -s $(mix_lua)) $url
 }
 
 web_file() { local file=${1#web-}; echo ${file%-close}; }
 close_of() { if [[ $1 == *-close ]]; then echo close; fi; }
-web_loads() { local file; for file in ${1:-$WEB_FILES}; do echo web-$file; done; }
 
 via_vip() {
     if [ $1 = elephant ]; then
@@ -276,7 +182,6 @@ direct3() {
     local load=$1 rate=$2 weights=(${3:-1 1 1}) weighted=${3:-} i part pids=() failed=0 HTTP_THREADS=$(( (HTTP_THREADS + 2) / 3 ))
     local sum=$(( weights[0] + weights[1] + weights[2] ))
     for i in $BACKENDS; do
-        part=.b$i
         {
             echo "## backend $i"
             if [ $load = elephant ]; then
@@ -341,121 +246,9 @@ cpu_all() {
     fi
 }
 
-check_rate() {
-    awk '/^traffic:/ { for (f = 2; f <= NF; f++) { split($f, kv, "="); v[kv[1]] = kv[2] }
-                       if (v["achieved_pps"] + 0 < 0.95 * v["target_pps"]) bad = 1 }
-         END { if (bad) print "invalid=rate" }' "$1.client" >> "$1.meta"
-}
-
-round_done() {
-    [ -f "$1.meta" ] && grep -q '^t_end_ns=' "$1.meta" && ! grep -q '^traffic_error=' "$1.meta" &&
-        { ! grep -q '^invalid=' "$1.meta" || grep -q '^link_bound=1$' "$1.meta"; }
-}
-
-plan_count() {
-    local out=$1 seconds=$2
-    PLAN_ROUNDS=$(( PLAN_ROUNDS + 1 )) PLAN_MS=$(( PLAN_MS + seconds * 1000 + OVERHEAD_MS ))
-    if [ "$RESUME" != 1 ] || ! round_done "$out"; then
-        PLAN_LEFT=$(( PLAN_LEFT + 1 )) PLAN_LEFT_MS=$(( PLAN_LEFT_MS + seconds * 1000 + OVERHEAD_MS ))
-    fi
-}
-
-round_begin() {
-    id=$1 out=$RUN_DIR/$1-r$rep
-    if [ -n "${RAN[$out]:-}" ]; then return 1; fi
-    RAN[$out]=1
-    if [ -n "$PLAN" ]; then plan_count "$out" $2; return 1; fi
-    if [ "$RESUME" = 1 ] && round_done "$out"; then echo "  $id r$rep    ข้าม (เสร็จแล้ว)"; return 1; fi
-    SEQ=$(( SEQ + 1 ))
-    tr ' ' '\n' <<< "case=$id rep=$rep seq=$SEQ $3" > "$out.meta"
-    echo "  $id r$rep"
-}
-
-reset_b() {
-    if [ -n "${B_OFF_PATH:-}" ]; then echo "b_mode=none" >> "$out.meta"; else on_b reset ${RESET_ARGS:-} >> "$out.meta"; fi
-    sleep $SETTLE
-}
-
-read_counters() { snapshot_all "$out" $1; }
-
-cpu_begin() { cpu_all start; }
-cpu_end() { cpu_all stop "$out"; }
-
-TRAFFIC_SUMMARY='^# (wrk2|h2load|iperf|timeout|tcpreplay) |^## backend|^Result:|pps .*errors|packets tra[a-z]*itted|'
-TRAFFIC_SUMMARY+='requests in|^Requests/sec|^Transfer/sec|Socket errors|Non-2xx|^ +(50|90|99)\.000%|^ +99\.900%|'
-TRAFFIC_SUMMARY+='\[SUM\]|^Actual:|^finished in|^requests:|^time for request:|^traffic:'
-
-traffic() {
-    local start
-    echo "  A\$ $*"
-    echo "# command: $*" > "$out.client"
-    start=$(date +%s%N)
-    echo "t_start_ns=$start" >> "$out.meta"
-    if [ -n "$LAST_END_NS" ]; then echo "gap_ms=$(( (start - LAST_END_NS) / 1000000 ))" >> "$out.meta"; fi
-    "$@" >> "$out.client" 2>&1 || echo "traffic_error=1" >> "$out.meta"
-    LAST_END_NS=$(date +%s%N)
-    echo "t_end_ns=$LAST_END_NS" >> "$out.meta"
-    grep -E "$TRAFFIC_SUMMARY" "$out.client" | sed 's/^/     /' || true
-}
-
-round_end() {
-    check_rate "$out"
-    if compgen -G "$out.lat*" >/dev/null; then gzip -f "$out".lat*; fi
-    if grep -q '^traffic_error=\|^invalid=' "$out.meta"; then echo "     $(grep '^traffic_error=\|^invalid=' "$out.meta" | tr '\n' ' ')"; fi
-}
-
-show_cpu() {
-    local idle=""
-    if [ -n "${IDLE_OUT:-}" ] && [ "$IDLE_OUT" != "$out" ]; then idle="idle $(mpstat_cores "$IDLE_OUT.cpu-$1.json.gz") core   "; fi
-    echo "  CPU ของ ${1^^} (mpstat)        ${idle}ระหว่างยิง $(mpstat_cores "$out.cpu-$1.json.gz") core"
-}
-mpstat_cores() {
-    python3 - "$1" <<'PY'
-import gzip, json, statistics, sys
-try:
-    host = json.loads(gzip.open(sys.argv[1]).read())["sysstat"]["hosts"][0]
-    loads = [next(c for c in s["cpu-load"] if c["cpu"] == "all") for s in host["statistics"]]
-    n = host["number-of-cpus"]
-    print("%.2f" % (n - statistics.mean(c["idle"] + c["iowait"] for c in loads) * n / 100))
-except Exception:
-    print("-")
-PY
-}
-
-idle_round() {
-    IDLE_OUT=$RUN_DIR/$1-idle-r$rep
-    round_begin $1-idle $IDLE_DURATION "kind=idle $2" || return 0
-    reset_b
-    read_counters 0
-    cpu_begin
-    traffic sleep $IDLE_DURATION
-    cpu_end
-    read_counters 1
-    round_end
-    show_cpu b
-}
-
-B_NIC='cat /sys/class/net/$LB_IFACE/statistics'
-C_NIC='cat /sys/class/net/$SERVER_IFACE/statistics'
-B_STATS='$REPO/xdp_lb_stats'
-B_PROG='bpftool prog show pinned $PIN/prog'
-C_UDP_IN='for i in 1 2 3; do ip netns exec server_$i nft list counter inet perf_sink udp_in; done | awk "\$1 == \"packets\" {s += \$2} END {print s}"'
-C_UDP_FRAG_IN='for i in 1 2 3; do ip netns exec server_$i nft list counter inet perf_sink udp_frag_in; done | awk "\$1 == \"packets\" {s += \$2} END {print s}"'
-C_REQUESTS='for i in 1 2 3; do echo b$i $(ip netns exec server_$i curl -s --max-time 1 http://$(backend_ip $i):$VPORT/nginx_status | awk "NR == 3 {print \$3}"); done'
-
 flow_meta() { echo "profile=$1 ports=$2 threads=${3:-$PKTGEN_THREADS} src_per_thread=$SRC_PER_THREAD duration=$DURATION"; }
-http_meta() { echo "http_tool=$HTTP_TOOL conns=$CONNS http_threads=$HTTP_THREADS keepalive_reqs=$KEEPALIVE_REQS http_duration=$HTTP_DURATION"; }
+http_meta() { echo "http_tool=wrk2 conns=$CONNS http_threads=$HTTP_THREADS keepalive_reqs=$KEEPALIVE_REQS http_duration=$HTTP_DURATION"; }
 ports_of() { if [ $1 = new ]; then echo $NEW_PORTS; else echo $EST_PORTS; fi; }
-fwd_stats() { awk '$1 == "xdp_redirect" || $1 == "xdp_tx" {n += $2} $1 == "icmp_sent" {n -= $2} END {print n + 0}'; }
-
-forwarded() {
-    if [ $1 = xdp ]; then cmd b "$B_STATS" | fwd_stats; else cmd b "$B_NIC/tx_packets"; fi
-}
-sent_of() { sed -n 's/^traffic:.* sent=\([0-9]*\) .*/\1/p' "$out.client"; }
-delta_requests() {
-    local i
-    for i in 1 2 3; do delta_field "C backend $i requests" b$i "$1" "$2"; done
-}
 
 read -r -d '' PERF_START_B <<'EOF' || true
 setsid perf stat -a -A -e cycles,ref-cycles -I 1000 -x, -o /run/perf-b.csv < /dev/null > /dev/null 2>&1 &
@@ -469,15 +262,10 @@ perf_prereq() {
     TSC_MHZ=$(remote b "turbostat --quiet --show TSC_MHz --interval 1 --num_iterations 1 2>/dev/null" | awk 'NR == 2 {print $1}')
     [[ "$TSC_MHZ" =~ ^[0-9]+$ ]] || { echo "อ่าน TSC ของ B ไม่ได้ (turbostat)"; exit 1; }
 }
-perf_start_check() {
-    if [ -n "$PLAN" ]; then return; fi
-    perf_prereq
-    trap 'remote b "kill -INT \$(cat /run/perf-b.pid 2>/dev/null) 2>/dev/null; true"' EXIT
-}
 
-perf_begin() { remote b "$PERF_START_B"; }
+read_perf_begin() { remote b "$PERF_START_B"; }
 
-perf_end() {
+read_perf_end() {
     remote b "$PERF_STOP_B" > "$out.perf.csv"
     awk -F, -v tsc=$TSC_MHZ '
         $5 == "cycles" { cycles += $3 }
@@ -498,25 +286,7 @@ perf_end() {
             printf "b_cpu_cores=%.3f\nb_cpu_cores_min=%.3f\nb_cpu_cores_max=%.3f\nb_cpu_hot_pct=%.1f\n",
                    sum / m, lo, hi, (span > 0 ? hot / (span * tsc * 1e6) * 100 : 0)
             printf "b_cpu_busy_s=%.3f\nb_cpu_cycles=%.0f\nb_perf_seconds=%d\nb_tsc_mhz=%s\n", busy_s, cycles, k, tsc
-        }' "$out.perf.csv" | tee -a "$out.meta" | sed 's/^/  /'
-}
-
-per_unit() {
-    awk -F= -v unit="$1" -v n=$2 '$1 == "b_cpu_cycles" {c = $2} $1 == "b_cpu_busy_s" {s = $2}
-        END {if (n > 0) printf "  CPU ของ B ต่อ %-17s %.0f cycles  %.0f ns\n", unit, c / n, s * 1e9 / n}' "$out.meta"
-}
-
-idle_perf() {
-    round_begin $1-idle $IDLE_DURATION "kind=idle $2" || return 0
-    reset_b
-    read_counters 0
-    cpu_begin
-    perf_begin
-    traffic sleep $IDLE_DURATION
-    perf_end
-    cpu_end
-    read_counters 1
-    round_end
+        }' "$out.perf.csv" >> "$out.meta"
 }
 
 read -r -d '' ONE_CORE_B <<'EOF' || true
@@ -544,17 +314,6 @@ for irq in $(awk -v d=$LB_IFACE '$0 ~ d {sub(":", "", $1); print $1}' /proc/inte
 done
 EOF
 
-reset_one_core() {
-    local pinned
-    reset_b
-    pinned=$(remote b "$ONE_CORE_B")
-    echo "$pinned" >> "$out.meta"
-    echo "  B 1 core: $(tr '\n' ' ' <<< "$pinned")"
-    grep -q '^b_irq_cpus=0$' <<< "$pinned" && grep -Eq '^b_rps_cpus=[0,]+$' <<< "$pinned" &&
-        { ! grep -q '^b_nginx' <<< "$pinned" || grep -q '^b_nginx_worker_cpus=0$' <<< "$pinned"; } ||
-        { echo "B ไม่ได้ใช้ core 0 core เดียว  หยุด"; exit 1; }
-}
-
 read -r -d '' CORE0_START_B <<'EOF' || true
 taskset -apc 1-3,5-7 $(pgrep -x mpstat) > /dev/null
 setsid taskset -c 3 perf stat -C 0,4 -A -e cycles,ref-cycles -I 1000 -x, -o /run/perf16.csv < /dev/null > /dev/null 2>&1 &
@@ -562,9 +321,9 @@ echo $! > /run/perf16.pid
 EOF
 CORE0_STOP_B='pid=$(cat /run/perf16.pid); kill -INT $pid; while kill -0 $pid 2>/dev/null; do sleep 0.1; done; cat /run/perf16.csv'
 
-core0_begin() { remote b "$CORE0_START_B"; }
+read_core0_begin() { remote b "$CORE0_START_B"; }
 
-core0_end() {
+read_core0_end() {
     remote b "$CORE0_STOP_B" > "$out.perf.csv"
     awk -F, -v tsc=$TSC_MHZ '
         $5 == "cycles" && $2 == "CPU0" { cycles += $3 }
@@ -582,31 +341,7 @@ core0_end() {
             m = n["CPU0"] > 2 ? n["CPU0"] - 2 : 1
             printf "b_cpu0_busy_pct=%.1f\nb_cpu0_busy_min=%.1f\nb_cpu0_busy_max=%.1f\nb_cpu4_busy_pct=%.1f\n", sum / m, lo, hi, sum4 / m
             printf "b_cpu0_busy_s=%.3f\nb_cpu0_cycles=%.0f\nb_perf_seconds=%d\nb_tsc_mhz=%s\n", busy_s["CPU0"], cycles, n["CPU0"], tsc
-        }' "$out.perf.csv" | tee -a "$out.meta" | sed 's/^/  /'
-}
-
-per_unit0() {
-    awk -F= -v unit="$1" -v n=$2 '$1 == "b_cpu0_cycles" {c = $2} $1 == "b_cpu0_busy_s" {s = $2}
-        END {if (n > 0) printf "  CPU 0 ต่อ %-20s %.0f cycles  %.0f ns\n", unit, c / n, s * 1e9 / n}' "$out.meta"
-}
-
-one_core_start() {
-    if [ -n "$PLAN" ]; then return; fi
-    perf_prereq
-    trap 'remote b "$END_B"' EXIT
-}
-
-idle_one_core() {
-    round_begin $1-idle $IDLE_DURATION "kind=idle $2" || return 0
-    reset_one_core
-    read_counters 0
-    cpu_begin
-    core0_begin
-    traffic sleep $IDLE_DURATION
-    core0_end
-    cpu_end
-    read_counters 1
-    round_end
+        }' "$out.perf.csv" >> "$out.meta"
 }
 
 c0_files() {
@@ -621,25 +356,12 @@ c0_files() {
 }
 c0_field() { awk -v s=$1 -v w=$2 -v f=$3 '$1 == s && $2 == w {print $f; exit}' $(c0_files) /dev/null 2>/dev/null || true; }
 c0() { local value; value=$(c0_field $1 $2 3); echo ${value:-0}; }
-need_c0() {
-    local scenario=$1 load
-    shift
-    if [ -n "$PLAN" ]; then return 0; fi
-    for load in "$@"; do
-        if [ -z "$(c0_field $scenario $load 3)" ]; then
-            echo "ยังไม่มี C0 ของ scenario=$scenario workload=$load ใน $RESULTS/0.x  รัน tcase/0.x.sh ของชุด $CAMPAIGN ก่อน"
-            exit 1
-        fi
-    done
-}
 levels() {
     local cap level
     cap=$(c0 $1 $2)
     for level in $3; do echo $level:$(( cap * level / 100 )); done
 }
 level_meta() { echo "level=${3%:*} rate=${3#*:} c0_scenario=$1 c0=$(c0 $1 $2) $(http_meta)"; }
-
-use_mode() { on_b mode $1 ${2:-} >/dev/null; on_c mode $(c_mode_for $1); }
 
 restore() {
     on_c mode guarded
@@ -648,83 +370,134 @@ restore() {
     on_b mode ${B_REST_MODE:-xdp} >/dev/null
 }
 
-check_test4() {
-    need_c0 $1 web-1k
-    if [ -z "$PLAN" ] && [ "$(c0_field $1 web-1k 4)" = 1 ]; then
-        echo "C0 ของ $1 ใช้สายเกิน 90% (link-bound)  ลด QUOTA ของข้อ 4 ก่อน"
-        exit 1
-    fi
-    check_variants
-}
-
-test4_levels() {
-    levels $1 web-1k "$TEST4_LEVELS"
-    if [ $rep -le $TEST4_SAT_REPS ]; then echo sat:sat; fi
-}
-
 variant_algo() {
-    local m
     case $1 in
         xdp:wcmp)  echo wcmp 4 ;;
-        xdp:lcf)   echo lcf 500 ;;
-        xdp:awfd*s) m=${1#xdp:awfd}; echo awfd ${m%s} 500 $TEST4_AWFD_TUNE ;;
-        xdp:awfd*) echo awfd ${1#xdp:awfd} 500 ;;
+        xdp:awfd4s) echo awfd 4 500 $TEST4_AWFD_TUNE ;;
         ipvs:wlc|nginx:least_conn|haproxy:leastconn) echo ${1#*:} ${QUOTA[$2]//%/} ;;
         *)         echo ${1#*:} ;;
     esac
 }
-check_variants() {
-    local kinds
-    kinds=$(for variant in $TEST4_VARIANTS; do [ ${variant%%:*} = xdp ] && echo xdp || echo other; done | sort -u)
-    [ $(wc -l <<< "$kinds") = 1 ] || { echo "TEST4_VARIANTS ผสม xdp กับ LB อื่น  แยกรันเป็นคนละครั้ง"; exit 1; }
-    [ "$kinds" = xdp ] || B_REST_MODE=${B_REST_MODE:-none}
+
+begin_round() {
+    id=$1 out=$RUN_DIR/$1-r$rep
+    [ ! -e "$out.meta" ] || { echo "มีผลของรอบนี้แล้ว: $out.meta  ใช้ RUN_DIR หรือ CAMPAIGN ใหม่"; exit 1; }
+    SEQ=$(( SEQ + 1 ))
+    tr ' ' '\n' <<< "case=$id rep=$rep seq=$SEQ $2" > "$out.meta"
+    echo "  $id r$rep"
 }
 
-overhead() {
-    read -r OVERHEAD_MS GAP_ROUNDS <<< "$(cat "$RUN_DIR"/*.meta 2>/dev/null |
-        awk -F= '$1 == "gap_ms" {sum += $2; n++} END {if (n) printf "%d %d", sum / n, n}')"
-    if [ -n "$OVERHEAD" ]; then OVERHEAD_MS=$(awk -v s=$OVERHEAD 'BEGIN {printf "%d", s * 1000}') GAP_ROUNDS=""; fi
-    OVERHEAD_MS=${OVERHEAD_MS:-5000}
-}
-hours() { awk -v ms=$1 'BEGIN {printf "%.2f", ms / 3600000}'; }
-
-plan_one() {
-    local TEST=$1
-    PLAN_ROUNDS=0 PLAN_LEFT=0 PLAN_MS=0 PLAN_LEFT_MS=0
-    t${TEST/./_} >/dev/null
-    echo $TEST $PLAN_ROUNDS $PLAN_LEFT $PLAN_MS $PLAN_LEFT_MS
-}
-plan_of() { ( PLAN=1; for id in "$@"; do plan_one $id; done ) }
-
-plan() {
-    local id rounds left ms left_ms notes sum=(0 0 0 0)
-    local -A RAN=()
-    notes=$(mktemp)
-    echo "แผนของ $RUN_DIR   เวลาเสียต่อรอบ $(awk -v ms=$OVERHEAD_MS 'BEGIN {printf "%.1f", ms / 1000}') s" \
-         "($([ -n "$GAP_ROUNDS" ] && echo "ค่าเฉลี่ยจาก $GAP_ROUNDS รอบ" || echo "OVERHEAD หรือค่าเริ่มต้น"))"
-    echo "  ข้อ     รอบ      ชม.   ยังไม่เสร็จ      ชม."
-    while read -r id rounds left ms left_ms; do
-        printf '  %-5s %5d %8s %10d %9s\n' $id $rounds $(hours $ms) $left $(hours $left_ms)
-        sum=($(( sum[0] + rounds )) $(( sum[1] + ms )) $(( sum[2] + left )) $(( sum[3] + left_ms )))
-    done < <(plan_of "${selected[@]}" 2>>"$notes")
-    printf '  %-5s %5d %8s %10d %9s\n' all ${sum[0]} $(hours ${sum[1]}) ${sum[2]} $(hours ${sum[3]})
-    sort -u "$notes" | sed 's/^/  * /'
-    rm -f "$notes"
+reset_lb() {
+    if [ -n "${B_OFF_PATH:-}" ]; then echo "b_mode=none" >> "$out.meta"; else on_b reset ${RESET_ARGS:-} >> "$out.meta"; fi
+    sleep $SETTLE
 }
 
-eta() {
-    local rounds left ms left_ms
-    overhead
-    read -r _ rounds left ms left_ms <<< "$(plan_of $TEST 2>/dev/null)"
-    echo "   ${rounds:-0} รอบ (ยังไม่เสร็จ ${left:-0})  ประมาณ $(( ${left_ms:-0} / 60000 )) นาที" \
-         "เสร็จราว $(date -d "+$(( ${left_ms:-0} / 1000 )) seconds" +%H:%M)"
+reset_lb_one_core() {
+    local pinned
+    reset_lb
+    pinned=$(remote b "$ONE_CORE_B")
+    echo "$pinned" >> "$out.meta"
+    grep -q '^b_irq_cpus=0$' <<< "$pinned" && grep -Eq '^b_rps_cpus=[0,]+$' <<< "$pinned" &&
+        { ! grep -q '^b_nginx' <<< "$pinned" || grep -q '^b_nginx_worker_cpus=0$' <<< "$pinned"; } ||
+        { echo "B ไม่ได้ใช้ core 0 core เดียว  หยุด"; exit 1; }
 }
 
-start_run() {
+read_counters_begin() { snapshot_all "$out" 0; }
+read_counters_end() { snapshot_all "$out" 1; }
+read_cpu_begin() { cpu_all start; }
+read_cpu_end() { cpu_all stop "$out"; }
+
+run_traffic() {
+    echo "# command: $*" > "$out.client"
+    echo "t_start_ns=$(date +%s%N)" >> "$out.meta"
+    "$@" >> "$out.client" 2>&1 || echo "traffic_error=1" >> "$out.meta"
+    echo "t_end_ns=$(date +%s%N)" >> "$out.meta"
+}
+
+run_idle_round() {
+    begin_round $1-idle "kind=idle $2"
+    reset_lb
+    read_counters_begin
+    read_cpu_begin
+    run_traffic sleep $IDLE_DURATION
+    read_cpu_end
+    read_counters_end
+}
+
+run_idle_perf() {
+    begin_round $1-idle "kind=idle $2"
+    reset_lb
+    read_counters_begin
+    read_cpu_begin
+    read_perf_begin
+    run_traffic sleep $IDLE_DURATION
+    read_perf_end
+    read_cpu_end
+    read_counters_end
+}
+
+run_idle_one_core() {
+    begin_round $1-idle "kind=idle $2"
+    reset_lb_one_core
+    read_counters_begin
+    read_cpu_begin
+    read_core0_begin
+    run_traffic sleep $IDLE_DURATION
+    read_core0_end
+    read_cpu_end
+    read_counters_end
+}
+
+prepare_perf() {
+    perf_prereq
+    trap 'remote b "kill -INT \$(cat /run/perf-b.pid 2>/dev/null) 2>/dev/null; true"' EXIT
+}
+
+prepare_one_core() {
+    perf_prereq
+    trap 'remote b "$END_B"' EXIT
+}
+
+need_c0() {
+    local scenario=$1 load
+    shift
+    for load in "$@"; do
+        if [ -z "$(c0_field $scenario $load 3)" ]; then
+            echo "ยังไม่มี C0 ของ scenario=$scenario workload=$load ใน $RESULTS/0.x  รันข้อ 0 ก่อน"
+            exit 1
+        fi
+    done
+}
+
+select_lb() {
+    local lb
+    for lb in "$@"; do
+        case $GROUP:$lb in :*|xdp:xdp*|xdp:direct|other:[!xd]*) echo $lb ;; esac
+    done
+}
+
+switch_lb() { on_b mode $1 ${2:-} >/dev/null; on_c mode $(c_mode_for $1); }
+
+check_test4() {
+    need_c0 $1 web-1k
+    [ "$(c0_field $1 web-1k 4)" != 1 ] || { echo "C0 ของ $1 ใช้สายเกิน 90% (link-bound)  ลด QUOTA ของข้อ 4 ก่อน"; exit 1; }
+    [ -n "$GROUP" ] || { echo "ใช้: $0 xdp | other   (ไม่รวมกันเพื่อลดการ reset การ์ดของ B)"; exit 1; }
+}
+
+test4_levels() {
+    levels $1 web-1k "$TEST4_LEVELS"
+    if [ $rep -le $(case $2 in *awfd4s) echo 3 ;; *) echo 1 ;; esac) ]; then echo sat:sat; fi
+}
+
+start_test() {
+    TEST=$1 GROUP=${2:-}
+    [[ "$GROUP" =~ ^(xdp|other|)$ ]] || { echo "ใช้: $0 [xdp | other]"; exit 1; }
+    [ "$GROUP" != other ] || B_REST_MODE=${B_REST_MODE:-none}
+    RUN_DIR=${RUN_DIR:-$RESULTS/$TEST}
     require_root
     modprobe pktgen
     mkdir -p "$RUN_DIR"
-    echo "=== $(date '+%F %T')  $*" >> "$RUN_DIR/env-a.txt"
+    echo "=== $(date '+%F %T')  tcase/$TEST.sh" >> "$RUN_DIR/env-a.txt"
     LB_MAC=$(mac_of $LB_IP)
     SERVER_MAC=$(mac_of $SERVER_IP)
     [ -n "$LB_MAC" ] && [ -n "$SERVER_MAC" ] || { echo "หา MAC ของ B หรือ C ไม่ได้"; exit 1; }
@@ -734,38 +507,16 @@ start_run() {
     {
         env_info $CLIENT_IFACE
         ip route get $VIP
-        echo "== settings  HTTP_TOOL=$HTTP_TOOL RAW_TOOL=$RAW_TOOL RESUME=$RESUME"
-        declare -p DURATION HTTP_DURATION HTTP_DURATION_DYNAMIC IDLE_DURATION REPS_UDP REPS_TEST2 REPS_TEST3 REPS_HTTP \
-            SETTLE PPS_LADDER SIZES SIZE_SWEEP_PPS STRESS_PPS PKTGEN_THREADS SRC_PER_THREAD EST_PORTS NEW_PORTS CONNS \
-            HTTP_THREADS SAT_RATE STREAMS WEB_FILES TEST1_MODES TEST12_LEVELS LAT_RATE VIP_COUNTS TEST2_PPS TEST3_PPS \
-            PMTU_PPS TEST4_VARIANTS TEST4_LEVELS TEST4_SAT_REPS QUOTA TEST4_SCENARIOS VIP_MTU
+        echo "== settings  http_tool=wrk2 raw_tool=hping3"
+        declare -p REPS DURATION HTTP_DURATION IDLE_DURATION SETTLE PKTGEN_THREADS SRC_PER_THREAD EST_PORTS NEW_PORTS \
+            CONNS HTTP_THREADS SAT_RATE STREAMS QUOTA VIP_MTU 2>/dev/null || true
     } >> "$RUN_DIR/env-a.txt"
     { echo "=== $(date '+%F %T')"; on_b env; } >> "$RUN_DIR/env-b.txt"
     { echo "=== $(date '+%F %T')"; on_c env; } >> "$RUN_DIR/env-c.txt"
     KEEPALIVE_REQS=$(sed -n 's/^nginx_keepalive_requests=//p' "$RUN_DIR/env-c.txt" | tail -1)
     SEQ=$(cat "$RUN_DIR"/*.meta 2>/dev/null | sed -n 's/^seq=//p' | sort -n | tail -1)
     SEQ=${SEQ:-0}
-    overhead
-    {
-        echo "== ค่าจริง  A $CLIENT_IFACE $CLIENT_IP  B $(remote b 'echo $LB_IFACE') $LB_IP $LB_MAC" \
-             " C $(remote c 'echo $SERVER_IFACE') $SERVER_IP $SERVER_MAC"
-        echo "   VIP $VIP  backend $(backend_ip 1) $(backend_ip 2) $(backend_ip 3)"
-    } | tee -a "$RUN_DIR/env-a.txt"
+    echo "== ข้อ $TEST  ($(date +%H:%M:%S))  ผลอยู่ที่ $RUN_DIR"
 }
 
-run_one() {
-    TEST=$1
-    RUN_DIR=${USER_RUN_DIR:-$RESULTS/$TEST}
-    shift
-    case "${1:-}" in
-        "")     ;;
-        plan)   overhead; selected=($TEST); plan; exit 0 ;;
-        report) exec python3 "$SCRIPT_DIR/report.py" "${2:-$RUN_DIR}" ;;
-        *)      echo "ใช้: $0 [plan | report [dir]]   ปรับค่าผ่าน env ได้ เช่น REPS=1 DURATION=5 $0"; exit 1 ;;
-    esac
-    start_run "tcase/$TEST.sh"
-    echo "== ข้อ $TEST  ($(date +%H:%M:%S))  ผลอยู่ที่ $RUN_DIR"
-    eta
-    t${TEST/./_}
-    python3 "$SCRIPT_DIR/report.py" "$RUN_DIR" | tee "$RUN_DIR/report.txt"
-}
+write_result() { python3 "$SCRIPT_DIR/report.py" "$RUN_DIR" | tee "$RUN_DIR/report.txt"; }

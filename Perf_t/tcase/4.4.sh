@@ -1,36 +1,33 @@
 #!/bin/bash
-source "$(dirname "${BASH_SOURCE[0]}")/run_lib.sh"
-
+REPS=10
+HTTP_DURATION=60
+TEST4_LEVELS="50 60 70 80"
+VARIANTS="xdp:ecmp xdp:wcmp xdp:awfd4s ipvs:rr ipvs:wlc nft:rr ipt:rr nginx:least_conn haproxy:leastconn"
 BEFORE=1-1-1
 AFTER=1-1-0.5
+source "$(dirname "$0")/run_lib.sh"
 
-one_round() {
-    local variant=$1 level=$2 RESET_ARGS="algo $(variant_algo $1 $BEFORE)" r0 r1
-    on_c quota ${QUOTA[$BEFORE]} >/dev/null
-    round_begin $TEST-${variant/:/-}-web-1k-${level%:*} $HTTP_DURATION "test=$TEST mode=${variant%%:*} algo=${variant#*:} scenario=dynamic workload=web-1k \
-$(level_meta $AFTER web-1k $level)" || return 0
-    reset_b
-    r0=$(cmd c "$C_REQUESTS")
-    read_counters 0
-    cpu_begin
-    traffic dynamic via_vip web-1k ${level#*:}
-    cpu_end
-    read_counters 1
-    round_end
-    r1=$(cmd c "$C_REQUESTS")
-    delta_requests "$r0" "$r1"
-}
+start_test 4.4 "$@"
+check_test4 $AFTER
 
-t4_4() {
-    local variant level HTTP_DURATION=$HTTP_DURATION_DYNAMIC
-    check_test4 $AFTER
-    for rep in $(seq $REPS_HTTP); do
-        for variant in $TEST4_VARIANTS; do
-            use_mode ${variant%%:*}
-            for level in $(test4_levels $AFTER); do one_round $variant $level; done
+for rep in $(seq $REPS); do
+    for variant in $(select_lb $VARIANTS); do
+        switch_lb ${variant%%:*}
+        RESET_ARGS="algo $(variant_algo $variant $BEFORE)"
+
+        for level in $(test4_levels $AFTER $variant); do
+            on_c quota ${QUOTA[$BEFORE]} >/dev/null
+            begin_round $TEST-${variant/:/-}-web-1k-${level%:*} "test=$TEST mode=${variant%%:*} algo=${variant#*:} \
+scenario=dynamic workload=web-1k $(level_meta $AFTER web-1k $level)"
+            reset_lb
+            read_counters_begin
+            read_cpu_begin
+            run_traffic dynamic via_vip web-1k ${level#*:}
+            read_cpu_end
+            read_counters_end
         done
     done
-    restore
-}
+done
 
-run_one 4.4 "$@"
+restore
+write_result

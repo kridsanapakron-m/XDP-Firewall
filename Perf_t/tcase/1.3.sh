@@ -1,38 +1,26 @@
 #!/bin/bash
-HTTP_DURATION=${HTTP_DURATION:-60}
-source "$(dirname "${BASH_SOURCE[0]}")/run_lib.sh"
+REPS=10
+HTTP_DURATION=60
+IDLE_DURATION=10
+LB_LIST="xdp ipvs nft ipt nginx haproxy"
+source "$(dirname "$0")/run_lib.sh"
 
-one_round() {
-    local mode=$1 rx0 rx1 by0 by1
-    round_begin $TEST-$mode $HTTP_DURATION "test=$TEST mode=$mode workload=elephant streams=$STREAMS \
-http_duration=$HTTP_DURATION" || return 0
-    reset_b
-    rx0=$(cmd b "$B_NIC/rx_packets")
-    by0=$(cmd b "$B_NIC/rx_bytes")
-    read_counters 0
-    cpu_begin
-    traffic via_vip elephant sat
-    cpu_end
-    read_counters 1
-    round_end
-    rx1=$(cmd b "$B_NIC/rx_packets")
-    by1=$(cmd b "$B_NIC/rx_bytes")
-    delta "B rx_packets" "$rx0" "$rx1"
-    delta "B rx_bytes" "$by0" "$by1"
-    ratio "B byte ต่อ packet" "$by0" "$by1" "$rx0" "$rx1"
-    show_cpu b
-}
+start_test 1.3 "$@"
 
-t1_3() {
-    local mode
-    for rep in $(seq $REPS_HTTP); do
-        for mode in $TEST1_MODES; do
-            use_mode $mode
-            idle_round $TEST-$mode "test=$TEST mode=$mode"
-            one_round $mode
-        done
+for rep in $(seq $REPS); do
+    for mode in $(select_lb $LB_LIST); do
+        switch_lb $mode
+        run_idle_round $TEST-$mode "test=$TEST mode=$mode"
+
+        begin_round $TEST-$mode "test=$TEST mode=$mode workload=elephant streams=$STREAMS http_duration=$HTTP_DURATION"
+        reset_lb
+        read_counters_begin
+        read_cpu_begin
+        run_traffic via_vip elephant sat
+        read_cpu_end
+        read_counters_end
     done
-    restore
-}
+done
 
-run_one 1.3 "$@"
+restore
+write_result
