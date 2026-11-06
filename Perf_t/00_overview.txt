@@ -55,7 +55,7 @@
   lb_usr lb_sys   lb_cores แยกชนิด: %usr+%nice, %sys, %irq+%soft (หัก idle แต่ละชนิด)          core  LB
   lb_soft         xdp ipvs nft ipt อยู่ใน soft เกือบทั้งหมด  nginx haproxy มี usr+sys ด้วย
   ns_per_fwd_pkt  lb_cores × เวลายิงจริง (ns) ÷ packet ที่ส่งต่อ                             ns    LB
-                  ส่งต่อ = xdp_redirect ของ xdp_lb_ctl stats (xdp) หรือ tx_packets ของ NIC (mode อื่น)
+                  ส่งต่อ = xdp_redirect + xdp_tx − icmp_sent ของ xdp_lb_stats (xdp) หรือ tx_packets ของ NIC (mode อื่น)
   ns_per_rx_pkt   เหมือนข้างบนแต่หารด้วย packet ที่ B รับ (ข้อ 3.4)                         ns    LB
   xdp_ns          run_time_ns ÷ run_cnt ของ prog (bpf_stats ข้อ 2 และ 3)                   ns    LB
   lookup_ns       ข้อ 2: เวลาเฉลี่ยต่อครั้งของฟังก์ชันประเมิน rule (bpftrace fentry/fexit)    ns    LB
@@ -104,6 +104,8 @@
             conn_map LRU 65,536 ไม่มี timeout, frag_cache_map LRU 65,536 timeout 30 s, vip_map/awfd_map 1,024
             quota (หัวข้อ 7), bpf_stats เปิดเฉพาะข้อ 2 3.0 3.1 3.4, fragment/pmtu ของ xdp ปิดยกเว้นข้อ 3.2-3.5
             nginx backend 1 worker keepalive_requests 100 (KEEPALIVE_REQS) ให้มี connection ใหม่ตลอดรอบ
+  config    ของ xdp ฝังในโค้ด: xdp_lb_conf.c = ค่าหลัก, conf/fragment 3.2 3.3 (ฝั่งเปิด) 3.5, conf/pmtu 3.4, conf/vip-N 2.1
+            ทุกชุดใช้ xdp_lb_conf.h ร่วมกัน  แก้แล้วต้อง make conf  อ่านตัวนับด้วย xdp_lb_stats
   workload  ขนาด frame, pps, flow profile, จำนวน fragment ต่อ datagram, ขนาด DF, connection, stream, ไฟล์ HTTP, rate, เวลา
 
 7. matrix กลาง (ค่าเริ่มต้นใน run_tests.sh  ปรับผ่าน env ได้)
@@ -322,6 +324,6 @@
     3.3 3.5 ใช้ tcpreplay กับ pcap ที่แบ่ง fragment ไว้แล้ว (16,384 datagram วนซ้ำ  IP ID ซ้ำทุก 16,384 datagram)
   - ตรวจบนเครื่องจริงยังไม่ได้ (เลือกทางที่ปลอดภัยไว้แล้ว และ pilot ตรวจซ้ำ)
       driver และ RSS เริ่มต้น       tune_machine ตั้ง sdfn ทุกครั้งแล้วพิมพ์ค่า, report แสดง q_share
-      XDP_TX/REDIRECT ใน tx_packets  ใช้ xdp_redirect / xdp_tx ของ xdp_lb_ctl stats แทน
+      XDP_TX/REDIRECT ใน tx_packets  ใช้ xdp_redirect + xdp_tx ของ xdp_lb_stats แทน
       switch รับ frame 1520 B ไหม    ล็อก MTU 1480 ไม่มี frame เกิน 1514 B
       rate จริงของ pktgen/hping3     ตรวจทุกรอบ ต่ำกว่า 95% = invalid=rate

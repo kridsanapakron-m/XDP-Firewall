@@ -24,7 +24,7 @@ pps=$TEST35_PPS dps=$(( TEST35_PPS / frags )) profile=est flows=1000 duration=$D
     round_end
     s1=$(cmd b "$B_STATS")
     f1=$(cmd c "$C_UDP_FRAG_IN")
-    fwd0=$(field xdp_redirect <<< "$s0") fwd1=$(field xdp_redirect <<< "$s1")
+    fwd0=$(fwd_stats <<< "$s0") fwd1=$(fwd_stats <<< "$s1")
     delta "B ส่งต่อ (packet)" "$fwd0" "$fwd1"
     delta_field "B frag_hit" frag_hit "$s0" "$s1"
     delta_field "B frag_miss" frag_miss "$s0" "$s1"

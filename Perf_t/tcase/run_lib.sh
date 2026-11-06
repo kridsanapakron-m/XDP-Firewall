@@ -437,7 +437,7 @@ idle_round() {
 
 B_NIC='cat /sys/class/net/$LB_IFACE/statistics'
 C_NIC='cat /sys/class/net/$SERVER_IFACE/statistics'
-B_STATS='$REPO/xdp_lb_ctl stats'
+B_STATS='$REPO/xdp_lb_stats'
 B_PROG='bpftool prog show pinned $PIN/prog'
 C_UDP_IN='for i in 1 2 3; do ip netns exec server_$i nft list counter inet perf_sink udp_in; done | awk "\$1 == \"packets\" {s += \$2} END {print s}"'
 C_UDP_FRAG_IN='for i in 1 2 3; do ip netns exec server_$i nft list counter inet perf_sink udp_frag_in; done | awk "\$1 == \"packets\" {s += \$2} END {print s}"'
@@ -446,8 +446,10 @@ C_REQUESTS='for i in 1 2 3; do echo b$i $(ip netns exec server_$i curl -s --max-
 flow_meta() { echo "profile=$1 ports=$2 threads=${3:-$PKTGEN_THREADS} src_per_thread=$SRC_PER_THREAD duration=$DURATION"; }
 http_meta() { echo "http_tool=$HTTP_TOOL conns=$CONNS http_threads=$HTTP_THREADS keepalive_reqs=$KEEPALIVE_REQS http_duration=$HTTP_DURATION"; }
 ports_of() { if [ $1 = new ]; then echo $NEW_PORTS; else echo $EST_PORTS; fi; }
+fwd_stats() { awk '$1 == "xdp_redirect" || $1 == "xdp_tx" {n += $2} $1 == "icmp_sent" {n -= $2} END {print n + 0}'; }
+
 forwarded() {
-    if [ $1 = xdp ]; then cmd b "$B_STATS" | field xdp_redirect; else cmd b "$B_NIC/tx_packets"; fi
+    if [ $1 = xdp ]; then cmd b "$B_STATS" | fwd_stats; else cmd b "$B_NIC/tx_packets"; fi
 }
 sent_of() { sed -n 's/^traffic:.* sent=\([0-9]*\) .*/\1/p' "$out.client"; }
 delta_requests() {

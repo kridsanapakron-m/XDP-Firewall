@@ -5,7 +5,7 @@
 
 # --- เครื่องและ interface ที่ต่อ switch (ดูชื่อจริงด้วย ip -br link) ---
 CLIENT_IP=192.168.100.10
-LB_IP=192.168.100.20            # ต้องตรงกับ device_ip ที่ฝังใน xdp_lb_ctl.c
+LB_IP=192.168.100.20            # ต้องตรงกับ device_ip ที่ฝังใน xdp_lb_conf.h
 SERVER_IP=192.168.100.30
 CLIENT_IFACE=eno1
 LB_IFACE=eno1
@@ -16,11 +16,11 @@ SSH_LB=root@$LB_IP
 SSH_SERVER=root@$SERVER_IP
 
 # --- service ---
-VIP=192.168.100.100             # ตั้งจริงบน LB_IFACE ของ B
+VIP=192.168.100.100             # ตั้งจริงบน LB_IFACE ของ B  VIP และ port ต้องตรงกับ xdp_lb_conf.c และ conf/*
 VPORT=8080                      # HTTP (nginx) และ UDP (pktgen, hping3)
 VPORT_FRAG=8081                 # UDP ที่เป็น fragment (ข้อ 3.3, 3.5) แยก port ไว้นับการส่งถึง
 IPERF_PORT=5001                 # iperf server ใน backend แต่ละตัว
-MULTI_VIP_FIRST=10.100.0.1      # VIP ชุดของข้อ 2 (ไล่ทีละหนึ่ง)  backend รับ 10.100.0.0/16 เป็น local
+MULTI_VIP_FIRST=10.100.0.1      # ต้องตรงกับ conf/vip-*  VIP ชุดของข้อ 2 (ไล่ทีละหนึ่ง)  backend รับ 10.100.0.0/16 เป็น local
 FLOW_SRC_BASE=10.200.0.1        # source IP ของ pktgen  thread t ใช้ 125 ตัวตั้งแต่ base + 125t
 VIP_MTU=1480                    # MTU ของ route ไป VIP บน A  ห่อ IPIP แล้วไม่เกิน 1500
 
@@ -38,7 +38,7 @@ KEEPALIVE_REQS=${KEEPALIVE_REQS:-100}   # nginx ปิด connection ทุก 1
 # --- path ---
 REPO=/root/XDP-Firewall         # repo ที่ build แล้วบนเครื่อง B และ C
 PERF_DIR=$REPO/Perf_t           # ที่วางสคริปต์ชุดนี้บน B และ C (setup_a_client.sh push)
-PIN=/sys/fs/bpf/xdp_lb_test     # xdp_lb_ctl และ xdp_lb_awfd ฝัง path นี้ไว้
+PIN=/sys/fs/bpf/xdp_lb_test     # xdp_lb_conf.h xdp_lb_stats.c xdp_lb_awfd.c ฝัง path นี้ไว้
 MAPS=$PIN/maps
 WEBROOT=/srv/bench
 QUEUES=${QUEUES:-4}             # จำนวนคิว RSS ของ NIC ที่ B และ C ใช้ทุกการทดสอบ

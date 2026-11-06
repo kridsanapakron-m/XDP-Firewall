@@ -13,9 +13,12 @@ LDLIBS_CTL := -lbpf
 
 BPF_OBJECTS := xdp_lb.o xdp_lb_deencap.o
 CTL_BINARY := xdp_lb_ctl
-CONF_BINARY := xdp_lb_conf
+STATS_BINARY := xdp_lb_stats
+CONF_BINARIES := xdp_lb_conf $(patsubst %.c,%,$(wildcard conf/*/xdp_lb_conf.c))
 
-all: $(BPF_OBJECTS) $(CTL_BINARY) $(CONF_BINARY)
+all: $(BPF_OBJECTS) $(STATS_BINARY) conf
+
+conf: $(CONF_BINARIES)
 
 xdp_lb.o: xdp_lb.c xdp_lb_common.h
 	$(CLANG) $(CFLAGS_BPF) -c xdp_lb.c -o $@
@@ -26,13 +29,16 @@ xdp_lb_deencap.o: xdp_lb_deencap.c
 $(CTL_BINARY): xdp_lb_ctl.c xdp_lb_common.h
 	$(CC) $(CFLAGS_CTL) xdp_lb_ctl.c -o $@ $(LDLIBS_CTL) -ljansson
 
-$(CONF_BINARY): xdp_lb_conf.c xdp_lb_common.h
-	$(CC) $(CFLAGS_CTL) xdp_lb_conf.c -o $@ $(LDLIBS_CTL)
+$(STATS_BINARY): xdp_lb_stats.c xdp_lb_common.h
+	$(CC) $(CFLAGS_CTL) xdp_lb_stats.c -o $@ $(LDLIBS_CTL)
+
+$(CONF_BINARIES): %: %.c xdp_lb_conf.h conf/vip_range.h xdp_lb_common.h
+	$(CC) $(CFLAGS_CTL) -I. $< -o $@ $(LDLIBS_CTL)
 
 clean:
-	rm -f $(BPF_OBJECTS) $(CTL_BINARY) $(CONF_BINARY)
+	rm -f $(BPF_OBJECTS) $(CTL_BINARY) $(STATS_BINARY) $(CONF_BINARIES)
 
-.PHONY: all clean
+.PHONY: all conf clean
 
 # AWFD (load_aware/DESIGN.md)
 AWFD_BINARIES := xdp_lb_awfd xdp_lb_agent load_aware/xdp_lb_awfd_check

@@ -1,9 +1,11 @@
 *.o
 xdp_lb_ctl
+xdp_lb_ctl.c
 /test/*.sh
 *test*
 *.json
 xdp_lb_conf
+xdp_lb_stats
 .*
 !load_aware/*.sh
 load_aware/xdp_lb_lab_conf

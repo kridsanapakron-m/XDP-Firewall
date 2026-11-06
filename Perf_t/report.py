@@ -229,7 +229,9 @@ def measure(directory, run_id, meta, latency=True):
             m[key[5:]] = d("b", key)
     lb = meta.get("b_mode", "none") != "none"
     m["b_rx"] = d("b", "nic_rx_packets") + d("b", "nic_rx_missed_errors")
-    m["b_fwd"] = m.get("xdp_redirect", 0) if meta.get("b_mode", "").startswith("xdp") else d("b", "nic_tx_packets")
+    # xdp ส่ง packet ออกการ์ดเดิมด้วย XDP_TX  icmp_sent คือ ICMP ของ PMTU ที่ออกทาง XDP_TX เหมือนกันแต่ไม่ใช่การส่งต่อ
+    m["b_fwd"] = (m.get("xdp_redirect", 0) + m.get("xdp_tx", 0) - m.get("icmp_sent", 0) if meta.get("b_mode", "").startswith("xdp")
+                  else d("b", "nic_tx_packets"))
     if (packets := d("b", "nic_rx_packets")) > 0:
         m["avg_pkt_bytes"] = d("b", "nic_rx_bytes") / packets
     if (runs := d("b", "xdp_run_cnt")) > 0:

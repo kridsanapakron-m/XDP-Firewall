@@ -423,6 +423,8 @@ encapsulate_and_redirect(struct xdp_md *ctx, const struct device_config *device,
     build_ipv4_header(outer_ipv4, outer_ip_size, IPPROTO_IPIP,
                       device->ip_address, backend_address);
 
+    if (route.ifindex == ctx->ingress_ifindex)
+        return XDP_TX;
     return bpf_redirect(route.ifindex, 0);
 }
 

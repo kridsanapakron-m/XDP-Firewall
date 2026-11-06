@@ -25,7 +25,6 @@ SCRIPT_DIR=$(realpath "$(dirname "$0")")
 source "$SCRIPT_DIR/perf_env.sh"
 MODE_FILE=/run/perf_b.mode      # "<mode> <จำนวน VIP หรือ ->"
 STATE=/run/perf_b.state         # feature และ algo ล่าสุดของ mode xdp  reset ใช้ตั้งกลับ
-CONFIG=/etc/xdp_lb/xdp_lb.json
 
 check_tools() {
     for tool in clang make bpftool jq ipvsadm nft iptables-legacy-restore conntrack nginx haproxy ping ethtool mpstat \
@@ -83,32 +82,32 @@ hash_object() {
     echo /tmp/xdp_lb_hash.o
 }
 
-# service แบบ VIP เดียว: tcp/udp 8080, udp 8081 (fragment), tcp 5001  ทุกตัวมี backend 3 ตัว
-# ชุด MULTI_VIP: udp 8080 อย่างเดียว VIP ลำดับที่ k มี backend เดียวคือ backend_of k
+# config ของ mode xdp ฝังในโค้ด: xdp_lb_conf.c = ค่าหลัก  conf/<ชื่อ>/ = เปิด feature หรือจำนวน VIP ของข้อ 2
+conf_binary() {
+    local fragment=off pmtu=off algo=ecmp
+    [ -f $STATE ] && source $STATE
+    case $1:$fragment:$pmtu in
+        -:off:off) echo "$REPO/xdp_lb_conf" ;;
+        -:on:off)  echo "$REPO/conf/fragment/xdp_lb_conf" ;;
+        -:off:on)  echo "$REPO/conf/pmtu/xdp_lb_conf" ;;
+        *:off:off) echo "$REPO/conf/vip-$1/xdp_lb_conf" ;;
+        *)         echo "ไม่มี config ของ VIP=$1 fragment=$fragment pmtu=$pmtu" >&2; exit 1 ;;
+    esac
+}
+
+apply_conf() {
+    local binary
+    binary=$(conf_binary $1)
+    "$binary" >/dev/null
+}
+
 xdp_up() {
-    local object=$REPO/xdp_lb.o count=$2 separator="" k=0 vip service
+    local object=$REPO/xdp_lb.o
     [ $1 = xdp-hash ] && object=$(hash_object)
-    mkdir -p $MAPS /etc/xdp_lb
+    mkdir -p $MAPS
     bpftool prog load $object $PIN/prog type xdp pinmaps $MAPS
     bpftool net attach xdpdrv pinned $PIN/prog dev $LB_IFACE overwrite    # แทนตัวเดิมโดยไม่ reset NIC
-    {
-        echo '{"fragment_handling": false, "icmp_pmtu": false, "services": ['
-        if [ $count = - ]; then
-            for service in tcp:$VPORT udp:$VPORT udp:$VPORT_FRAG tcp:$IPERF_PORT; do
-                printf '%s{"vip": "%s", "port": %d, "protocol": "%s", "backends": ["%s", "%s", "%s"]}\n' \
-                    "$separator" $VIP ${service#*:} ${service%%:*} $(backend_ip 1) $(backend_ip 2) $(backend_ip 3)
-                separator=,
-            done
-        else
-            for vip in $(vip_list $count); do
-                printf '%s{"vip": "%s", "port": %d, "protocol": "udp", "backends": ["%s"]}\n' \
-                    "$separator" $vip $VPORT $(backend_of $k)
-                separator=, k=$((k + 1))
-            done
-        fi
-        echo ']}'
-    } > $CONFIG
-    "$REPO/xdp_lb_ctl" apply
+    apply_conf $2
     echo "md5 ของ object: $(md5sum $object | cut -c1-12)"
 }
 
@@ -256,8 +255,8 @@ load_mode() {
 }
 
 set_mode() {
-    load_mode "$@"
     printf 'fragment=off\npmtu=off\nalgo=ecmp\n' > $STATE     # mode ใหม่ = fragment, pmtu ปิด ไม่มี daemon
+    load_mode "$@"
     echo "B mode=$(cat $MODE_FILE)"
 }
 
@@ -295,8 +294,10 @@ set_algo() {
 
 set_feature() {
     [[ "$1" =~ ^(fragment|pmtu)$ && "$2" =~ ^(on|off)$ ]] || { echo "feature fragment|pmtu on|off"; exit 1; }
-    "$REPO/xdp_lb_ctl" $1 $2
+    local count
     set_state $1 $2
+    read -r _ count < $MODE_FILE
+    apply_conf $count
 }
 
 # สภาพก่อนยิงทุกรอบ: map ว่าง (โหลดใหม่), conntrack และ ipvs ว่าง, feature/algo เท่าเดิม
@@ -321,8 +322,6 @@ reset() {
     [ -f $STATE ] && source $STATE
     load_mode $mode $count >/dev/null
     if [ -e $MAPS/awfd_map ]; then
-        [ $fragment = on ] && "$REPO/xdp_lb_ctl" fragment on >/dev/null
-        [ $pmtu = on ] && "$REPO/xdp_lb_ctl" pmtu on >/dev/null
         set_algo $algo >/dev/null
         for map in conn_map frag_cache_map; do
             echo "b_${map}_max=$(bpftool -j map show pinned $MAPS/$map | jq .max_entries)"
@@ -342,7 +341,7 @@ reset() {
 
 up() {
     check_tools
-    make -C "$REPO" xdp_lb.o xdp_lb_ctl xdp_lb_awfd >/dev/null
+    make -C "$REPO" xdp_lb.o xdp_lb_stats xdp_lb_awfd conf >/dev/null
     tune_machine $LB_IFACE
     sysctl -qw net.ipv4.ip_forward=1
     for scope in all default $LB_IFACE; do
@@ -363,7 +362,7 @@ snapshot() {
     host_snapshot $LB_IFACE
     if [ -e $PIN/prog ]; then
         bpftool -j prog show pinned $PIN/prog | jq -r '"xdp_run_cnt=\(.run_cnt // 0)", "xdp_run_time_ns=\(.run_time_ns // 0)"'
-        "$REPO/xdp_lb_ctl" stats | awk '{print "stat_" $1 "=" $2}'
+        "$REPO/xdp_lb_stats" | awk '{print "stat_" $1 "=" $2}'
     fi
     echo "ct_count=$(conntrack -C 2>/dev/null || echo 0)"
 }
@@ -414,7 +413,7 @@ status() {
     else
         echo "daemon: หยุด"
     fi
-    [ -e $PIN/prog ] && "$REPO/xdp_lb_ctl" stats || true
+    [ -e $PIN/prog ] && "$REPO/xdp_lb_stats" || true
 }
 
 require_root
