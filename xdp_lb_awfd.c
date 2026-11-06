@@ -1,6 +1,5 @@
 #include <arpa/inet.h>
 #include <errno.h>
-#include <getopt.h>
 #include <bpf/bpf.h>
 #include <poll.h>
 #include <stdio.h>
@@ -14,13 +13,12 @@
 #define MISSED_ROUNDS_LIMIT 3
 
 static const char usage[] =
-    "usage: xdp_lb_awfd [-m max_weight] [-i interval_ms] [-a ewma_pct] [-f floor_pct] [-v] [--static]\n"
+    "usage: xdp_lb_awfd [-m max_weight] [-i interval_ms] [-a ewma_pct] [-f floor_pct] [-v]\n"
     "  -m        largest weight m, 1..16 (default 4, Figure 10)\n"
     "  -i        polling interval in ms (default 500, Figure 12)\n"
     "  -a        EWMA weight of the newest U in %, 1..100 (default 100 = no smoothing)\n"
     "  -f        share of C always counted as available in %, 0..100 (default 0)\n"
-    "  -v        print U, smoothed U and weight of every backend each round\n"
-    "  --static  weights from capacity C only (WCMP) instead of available capacity\n";
+    "  -v        print U, smoothed U and weight of every backend each round\n";
 
 struct probed_backend {
     __be32 address;
@@ -35,7 +33,6 @@ static struct probed_backend probed[MAX_BACKEND_SLOTS];
 static size_t probed_count;
 static __u32 max_weight = 4;
 static long long interval_ms = 500;
-static int static_weights;
 static __u32 ewma_pct = 100;
 static __u32 floor_pct;
 static int verbose;
@@ -78,8 +75,6 @@ static __u32 backend_available(const struct probed_backend *backend)
 {
     if (!backend || backend->missed_rounds > MISSED_ROUNDS_LIMIT)
         return 0;
-    if (static_weights)
-        return backend->capacity_milli;
     __u32 spare = backend->smoothed_milli < AWFD_MILLI ? AWFD_MILLI - backend->smoothed_milli : 0;
     __u32 share = floor_pct * AWFD_MILLI / 100 + (100 - floor_pct) * spare / 100;
 
@@ -204,10 +199,9 @@ static void remove_stale_vips(int vip_fd, int awfd_fd)
 
 int main(int argc, char **argv)
 {
-    static const struct option options[] = { { "static", no_argument, NULL, 's' }, {} };
     int option, vip_fd, backend_fd, awfd_fd, sock;
 
-    while ((option = getopt_long(argc, argv, "m:i:a:f:v", options, NULL)) != -1) {
+    while ((option = getopt(argc, argv, "m:i:a:f:v")) != -1) {
         if (option == 'm')
             max_weight = atoi(optarg);
         else if (option == 'i')
@@ -218,8 +212,6 @@ int main(int argc, char **argv)
             floor_pct = atoi(optarg);
         else if (option == 'v')
             verbose = 1;
-        else if (option == 's')
-            static_weights = 1;
         else
             break;
     }

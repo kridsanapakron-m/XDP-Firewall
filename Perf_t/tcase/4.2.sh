@@ -2,7 +2,7 @@
 REPS=10
 HTTP_DURATION=40
 TEST4_LEVELS="50 60 70 80"
-VARIANTS="xdp:ecmp xdp:wcmp xdp:awfd4s ipvs:rr ipvs:wlc nft:rr ipt:rr nginx:least_conn haproxy:leastconn"
+VARIANTS="xdp:ecmp xdp:awfd4s ipvs:rr ipvs:wlc nft:rr ipt:rr nginx:least_conn haproxy:leastconn"
 SCENARIO=1-1-0.5
 source "$(dirname "$0")/run_lib.sh"
 

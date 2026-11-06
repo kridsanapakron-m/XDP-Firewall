@@ -246,8 +246,8 @@
     load ของข้อ 4: run1 (2026-10-31) ใช้ 50 75 90% ของ C0 แต่ทางผ่าน LB รับได้แค่ Ω ≈ 0.88-0.92 ของ C0 (C0 ยิงตรง)
       ระดับ 90% จึงล้นเกือบทุก LB  run2 (2026-11-02) ใช้ 50 60 70 80% (TEST4_LEVELS) ต่ำกว่าเพดาน ไม่รัน sat และ single ซ้ำ
       ผล run1 (มี sat/Ω, 75%, 90%, 4.0 single) อยู่ที่ results/20261018/4.0-run1 ... 4.5-run1  run2 อยู่ที่ 4.0 ... 4.5
-    ตั้งแต่ 2026-11-06 tcase ไม่รัน awfd4 เดิมแล้ว  ข้อ 3.1 และข้อ 4 ใช้ awfd4s  ผล awfd4 เดิมยังอยู่ในชุด 20261018
-    xdp:awfd4s = awfd4 ที่แก้ herding (EWMA ของ U -a 30, floor -f 25  load_aware/DESIGN.md หัวข้อ 11)  ผลที่ 4.x-awfd4s
+    ตั้งแต่ 2026-11-06 ตัด awfd4 เดิมและ xdp wcmp ออกจากการทดลองและผลทั้งหมด  ข้อ 3.1 และข้อ 4 ใช้ awfd4s
+    xdp:awfd4s = AWFD m=4 ที่แก้ herding (EWMA ของ U -a 30, floor -f 25  load_aware/DESIGN.md หัวข้อ 11)  ผลที่ 4.x-awfd4s
       ใช้ load เดียวกับ run2 + sat 3 rep  ค่า b<i>_conn_pct เริ่มมีในชุดนี้
     IRQ ของ B: หลังถอด/ใส่ XDP การ์ด reset และ kernel กระจาย IRQ ของ 8 คิวไปทุก core เอง (ไม่ได้ผูก 0-3 ตามหัวข้อ 1)
       ข้อ 4 run1 run2 และ 3.x ชุดใหม่รันในสภาพนี้ทั้งหมด  B ไม่ใช่คอขวดของข้อ 4
@@ -255,18 +255,17 @@
     ไฟล์ 10k ขึ้นไปติดสายแม้ลด quota จึงใช้ web-1k อย่างเดียว  C0 ที่ link_bound = 1 สคริปต์ไม่รันข้อนั้น
     sat แยกอัลกอริทึมไม่ได้ (ทุก backend ถูกใช้เต็ม Ω ≈ 1) จึงรันแค่ 1 rep ไว้เช็ค Ω < 0.9
     variant (TEST4_VARIANTS = <LB>:<อัลกอริทึม>)  ตัวแทนของแต่ละ LB: แบ่งเท่ากัน / ถ่วงน้ำหนักคงที่ / ดูภาระ
-      xdp:ecmp xdp:wcmp xdp:awfd4   ipvs:rr ipvs:wlc   nft:rr   ipt:rr   nginx:least_conn   haproxy:leastconn
+      xdp:ecmp xdp:awfd4s   ipvs:rr ipvs:wlc   nft:rr   ipt:rr   nginx:least_conn   haproxy:leastconn
       least-connection (ipvs wlc, nginx least_conn, haproxy leastconn) ใส่น้ำหนัก = quota ตอนเริ่มรอบ (4.4 ไม่อัปเดตตาม)
       ต่อ variant ต่อข้อ: 3 load × 10 rep + sat 1 = 31 รอบ
     แบ่งเป็นก้อน ≤ ~70 นาที รอสั่งทีละก้อน พักระหว่างก้อน ≥ 10 นาที  ห้ามผสม xdp กับ LB อื่นในก้อนเดียว (check_variants)
       ก้อน   ข้อ  TEST4_VARIANTS                          รอบ    ชม.
       pre    0.3  C0 ของ 4 scenario                          40   0.5   (B ไม่อยู่ในเส้นทาง)
       p1     4.2  xdp ×3  REPS=1 load 90 (ลองสั้น)            3   ~0.05 (RUN_DIR แยก)
-      3a     4.1  xdp:ecmp xdp:wcmp xdp:awfd4              93   1.11
-      3b     4.2  (เหมือน 3a)                               93   1.11
-      3c     4.3  (เหมือน 3a)                               93   1.11
-      3d     4.4  xdp:ecmp xdp:wcmp                        62   1.08
-      3e     4.4  xdp:awfd4                                31   0.54
+      3a     4.1  xdp:ecmp xdp:awfd4s
+      3b     4.2  (เหมือน 3a)
+      3c     4.3  (เหมือน 3a)
+      3d     4.4  xdp:ecmp xdp:awfd4s
       p2     4.2  LB อื่น 6 แบบ REPS=1 load 90 (ลองสั้น ถอด XDP = reset การ์ดครั้งที่ 1)  ~0.1
       4a-c   4.1  ipvs:rr ipvs:wlc / nft:rr ipt:rr / nginx:least_conn haproxy:leastconn   ก้อนละ 62  0.74
       4d-f   4.2  (เหมือน 4a-c)                                                           ก้อนละ 62  0.74

@@ -372,7 +372,6 @@ restore() {
 
 variant_algo() {
     case $1 in
-        xdp:wcmp)  echo wcmp 4 ;;
         xdp:awfd4s) echo awfd 4 500 $TEST4_AWFD_TUNE ;;
         ipvs:wlc|nginx:least_conn|haproxy:leastconn) echo ${1#*:} ${QUOTA[$2]//%/} ;;
         *)         echo ${1#*:} ;;

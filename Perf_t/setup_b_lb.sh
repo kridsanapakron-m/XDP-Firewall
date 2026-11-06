@@ -7,7 +7,7 @@
 #             ipvs      IPVS โหมด tunnel            nft       nftables DNAT
 #             ipt       iptables-legacy DNAT        nginx     nginx stream proxy (TCP + UDP)
 #             haproxy   haproxy TCP proxy           none      ไม่มี LB
-#       ./setup_b_lb.sh algo ecmp | wcmp [m] | lcf | awfd [m] [interval_ms] [ewma_pct] [floor_pct]   (mode xdp)
+#       ./setup_b_lb.sh algo ecmp | lcf | awfd [m] [interval_ms] [ewma_pct] [floor_pct]   (mode xdp)
 #       ./setup_b_lb.sh algo rr | wlc|least_conn|leastconn <w1> <w2> <w3>   (ipvs | nginx | haproxy ข้อ 4  nft ipt แบ่งเท่ากันเท่านั้น)
 #       ./setup_b_lb.sh feature fragment|pmtu on|off
 #       ./setup_b_lb.sh reset [algo ...]     โหลด mode เดิมใหม่ + feature/algo เดิม + ล้าง conntrack/ipvs (ก่อนทุกรอบ)
@@ -282,10 +282,9 @@ set_algo() {
     set_state algo "$*"
     case $1 in
         ecmp) return ;;
-        wcmp) set -- --static -m ${2:-4} ;;
         lcf)  set -- -m 1 -i ${2:-500} ;;
         awfd) set -- -m ${2:-4} -i ${3:-500} ${4:+-a $4} ${5:+-f $5} -v ;;
-        *)    echo "algo: ecmp | wcmp [m] | lcf [interval_ms] | awfd [m] [interval_ms] [ewma_pct] [floor_pct]"; exit 1 ;;
+        *)    echo "algo: ecmp | lcf [interval_ms] | awfd [m] [interval_ms] [ewma_pct] [floor_pct]"; exit 1 ;;
     esac
     setsid taskset -c $DAEMON_CPU "$REPO/xdp_lb_awfd" "$@" >/var/log/perf-awfd.log 2>&1 < /dev/null &
     echo $! > /run/perf-awfd.pid
