@@ -22,7 +22,7 @@
 
 enum packet_kind {
     PACKET_UNSUPPORTED,
-    PACKET_WHOLE,
+    PACKET_Normal,
     PACKET_FIRST_FRAGMENT,
     PACKET_LATER_FRAGMENT,
 };
@@ -136,7 +136,7 @@ parse_client_packet(struct xdp_md *ctx, struct flow_key *flow,
     flow->destination_port = ports->destination;
     flow->protocol = ipv4->protocol;
 
-    return (frag_off & IPV4_MF) ? PACKET_FIRST_FRAGMENT : PACKET_WHOLE;
+    return (frag_off & IPV4_MF) ? PACKET_FIRST_FRAGMENT : PACKET_Normal;
 }
 
 static __always_inline __u32 fnv1a_flow_hash(const struct flow_key *flow)
@@ -444,11 +444,11 @@ static __always_inline int load_balance(struct xdp_md *ctx, struct lb_stats *sta
     if (kind == PACKET_UNSUPPORTED)
         return XDP_PASS;
 
-    if (kind != PACKET_WHOLE && !device->fragment_handling_enabled)
+    if (kind != PACKET_Normal && !device->fragment_handling_enabled)
         return XDP_PASS;
 
     backend_address = kind == PACKET_LATER_FRAGMENT ? 0 : awfd(&flow, stats);
-    if (kind != PACKET_WHOLE)
+    if (kind != PACKET_Normal)
         backend_address = frag_handle(ipv4, kind, backend_address, stats);
     if (!backend_address)
         return XDP_PASS;

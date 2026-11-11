@@ -8,7 +8,6 @@
 set -e
 
 SCRIPT_DIR=$(realpath "$(dirname "$0")")
-# shellcheck source=perf_env.sh
 source "$SCRIPT_DIR/perf_env.sh"
 
 check_tools() {
@@ -36,8 +35,6 @@ up() {
         sysctl -qw net.ipv4.conf.$scope.rp_filter=0
         sysctl -qw net.ipv4.conf.$scope.accept_redirects=0
     done
-    # TCP ไป VIP ใช้ MTU 1480: ห่อ IPIP แล้วยังไม่เกิน 1500 ไม่ต้องพึ่ง PMTU ของ LB (xdp ปิด pmtu อยู่)
-    # ทาง direct ไป backend ตั้งเท่ากัน ขนาด segment ของ C0 จะได้ตรงกับตอนผ่าน LB
     ip route replace $VIP/32 dev $CLIENT_IFACE mtu lock $VIP_MTU
     ip route replace 192.168.200.0/22 via $SERVER_IP dev $CLIENT_IFACE mtu lock $VIP_MTU
     for host in $SSH_LB $SSH_SERVER; do
